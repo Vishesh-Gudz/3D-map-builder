@@ -415,8 +415,13 @@ def main():
                         help="Export stride-sampled, resized/cropped images to this folder")
 
     args = parser.parse_args()
-    assert args.image_folder or args.video_path, \
-        "Provide --image_folder or --video_path"
+    if not args.image_folder and not args.video_path:
+        default_video_path = os.path.join(os.path.dirname(__file__), "assets", "demo.mp4")
+        if os.path.exists(default_video_path):
+            args.video_path = default_video_path
+            print(f"No input provided; using bundled demo video: {args.video_path}")
+        else:
+            raise AssertionError("Provide --image_folder or --video_path")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

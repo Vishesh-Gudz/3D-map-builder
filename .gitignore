@@ -17,3 +17,20 @@ weights/
 **/.DS_Store
 docs/
 
+# ── sg-map-builder service additions ──────────────────────────────
+# environment
+.venv/
+
+# model checkpoints — 4.6GB, never in git (fetched from HuggingFace)
+*.pt
+
+# generated output
+maps/
+output_pointcloud*.mp4
+*.ply
+*.log
+
+# demo byproducts (frame extractions, sky-mask caches)
+*_frames/
+*_sky_masks/
+
