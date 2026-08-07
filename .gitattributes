@@ -1,0 +1,2 @@
+*.sh text eol=lf
+fetch_model.py text eol=lf

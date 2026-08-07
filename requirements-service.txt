@@ -1,0 +1,6 @@
+# Extra deps for the map-builder HTTP service (on top of the lingbot-map
+# package + torch, which the base GPU image / `pip install -e .` provide).
+fastapi
+uvicorn[standard]
+httpx
+onnxruntime

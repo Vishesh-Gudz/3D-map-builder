@@ -28,7 +28,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 import engine
 
@@ -51,6 +51,7 @@ def _chunk_payload(session: engine.MapSession, chunk: engine.Chunk) -> dict:
         "count": chunk.count,
         "points": base64.b64encode(chunk.points).decode("ascii"),
         "colors": base64.b64encode(chunk.colors).decode("ascii"),
+        "confs": base64.b64encode(chunk.confs).decode("ascii"),
         "pose": chunk.pose,
     }
 
@@ -155,6 +156,16 @@ async def chunks(session_id: str, since: int = 0) -> JSONResponse:
         raise HTTPException(404, "no such session")
     pending = [c for c in _chunk_buffer if c["seq"] > since]
     return JSONResponse({"chunks": pending, "state": s.state})
+
+
+@app.get("/maps/{session_id}.ply")
+async def download_ply(session_id: str) -> FileResponse:
+    """Serve a finished session's point cloud (works after the session ends)."""
+    path = os.path.join(engine.MAPS_DIR, f"{session_id}.ply")
+    if not os.path.isfile(path) or "/" in session_id or "\\" in session_id:
+        raise HTTPException(404, "no such map")
+    return FileResponse(path, media_type="application/octet-stream",
+                        filename=f"map-{session_id}.ply")
 
 
 @app.post("/session/{session_id}/stop")

@@ -119,6 +119,7 @@ class Chunk:
     count: int
     points: bytes  # Float32 xyz interleaved
     colors: bytes  # Uint8 rgb interleaved
+    confs: bytes   # Float32 per-point confidence (viewer visibility threshold)
     pose: list     # 16 floats, c2w row-major (camera trail)
 
 
@@ -219,7 +220,7 @@ class MapSession:
         rgb_s = rgb[::st, ::st].reshape(-1, 3)
 
         keep = conf_s >= CONF_THRESHOLD
-        wp_s, rgb_s = wp_s[keep], rgb_s[keep]
+        wp_s, rgb_s, conf_s = wp_s[keep], rgb_s[keep], conf_s[keep]
         if wp_s.shape[0] == 0:
             return None
 
@@ -231,7 +232,7 @@ class MapSession:
             (k not in self.voxels for k in keys), dtype=bool, count=len(keys)
         )
         self.voxels.update(keys[new_mask].tolist())
-        wp_new, rgb_new = wp_s[new_mask], rgb_s[new_mask]
+        wp_new, rgb_new, conf_new = wp_s[new_mask], rgb_s[new_mask], conf_s[new_mask]
         if wp_new.shape[0] == 0:
             return None
 
@@ -256,6 +257,7 @@ class MapSession:
             count=int(wp_new.shape[0]),
             points=wp_new.astype(np.float32).tobytes(),
             colors=rgb_new.astype(np.uint8).tobytes(),
+            confs=conf_new.astype(np.float32).tobytes(),
             pose=pose_mat,
         )
 
