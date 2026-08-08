@@ -41,6 +41,10 @@ app = FastAPI(title="sg-map-builder")
 _session: Optional[engine.MapSession] = None
 _chunk_buffer: list[dict] = []
 _push_client = httpx.AsyncClient(timeout=10)
+# Chunks leave through a background worker so the /frame handler returns the
+# moment inference is done — the pod→Express push must not hold up the next
+# frame (Express gates uploads on our response).
+_push_queue: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=200)
 
 
 def _chunk_payload(session: engine.MapSession, chunk: engine.Chunk) -> dict:
@@ -65,11 +69,24 @@ async def _push_chunk(payload: dict) -> None:
         print(f"[server] chunk push failed: {err}")
 
 
+async def _push_worker() -> None:
+    """Drain the chunk queue in order — one slow push never blocks inference."""
+    while True:
+        payload = await _push_queue.get()
+        t0 = time.perf_counter()
+        await _push_chunk(payload)
+        dt = (time.perf_counter() - t0) * 1000
+        if dt > 500:
+            print(f"[push] seq {payload.get('seq')} took {dt:.0f}ms "
+                  f"(queue {_push_queue.qsize()})")
+
+
 @app.on_event("startup")
 async def _boot() -> None:
     # Load the model up front so the first session doesn't eat the delay.
     await asyncio.to_thread(engine.load_model)
     asyncio.get_event_loop().create_task(_idle_reaper())
+    asyncio.get_event_loop().create_task(_push_worker())
 
 
 async def _idle_reaper() -> None:
@@ -127,18 +144,29 @@ async def frame(session_id: str, request: Request) -> dict:
     if s.state == "stopped":
         raise HTTPException(409, "session stopped")
 
+    t0 = time.perf_counter()
     jpeg = await request.body()
+    t_recv = time.perf_counter()
     if len(jpeg) < 100:
         raise HTTPException(400, "empty frame")
 
     chunks = await asyncio.to_thread(s.add_frame, jpeg)
+    t_infer = time.perf_counter()
 
     payloads = [_chunk_payload(s, c) for c in chunks]
     for p in payloads:
         _chunk_buffer.append(p)
         if len(_chunk_buffer) > CHUNK_BUFFER_MAX:
             _chunk_buffer.pop(0)
-        await _push_chunk(p)
+        try:
+            _push_queue.put_nowait(p)  # background worker delivers, in order
+        except asyncio.QueueFull:
+            print(f"[server] push queue full — dropping seq {p['seq']}")
+
+    new_pts = sum(c.count for c in chunks)
+    print(f"[frame {s.frames_mapped}] recv {1000 * (t_recv - t0):.0f}ms | "
+          f"infer {1000 * (t_infer - t_recv):.0f}ms | +{new_pts} pts | "
+          f"queue {_push_queue.qsize()}")
 
     return {
         "accepted": True,

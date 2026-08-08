@@ -150,7 +150,9 @@ class MapSession:
         self.last_frame_at = time.time()
         self.frames_in += 1
 
+        t0 = time.perf_counter()
         frame = _preprocess_jpeg(jpeg_bytes)
+        t_pre = time.perf_counter()
 
         if self.state == "warming":
             self.warm_buffer.append(frame)
@@ -191,7 +193,12 @@ class MapSession:
             )
             if not is_keyframe:
                 model._set_skip_append(False)
+            t_fwd = time.perf_counter()
             chunk = self._emit(out, frame_b, 0)
+        t_emit = time.perf_counter()
+        print(f"[engine] pre {1000 * (t_pre - t0):.0f}ms | "
+              f"fwd {1000 * (t_fwd - t_pre):.0f}ms | "
+              f"emit {1000 * (t_emit - t_fwd):.0f}ms")
         return [chunk] if chunk is not None else []
 
     # ── point extraction ─────────────────────────────────────────────────
