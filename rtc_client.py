@@ -69,17 +69,15 @@ async def _request_with_retry(self, request):
 _turn.TurnClientMixin.request_with_retry = _request_with_retry
 # ─────────────────────────────────────────────────────────────────────────────
 
-# TURN relay — REQUIRED in practice: the phone and the pod both sit behind NAT
-# (home WiFi + RunPod container) and plain STUN hole-punch fails. TURN on THIS
-# side alone is enough: the phone can always reach the TURN server's public
-# address, so media flows phone↔TURN↔pod. Defaults are the free OpenRelay
-# service; override with your own coturn for production.
-TURN_URLS = [u for u in os.environ.get(
-    "TURN_URLS",
-    "turn:openrelay.metered.ca:80,turn:openrelay.metered.ca:443",
-).split(",") if u]
-TURN_USERNAME = os.environ.get("TURN_USERNAME", "openrelayproject")
-TURN_PASSWORD = os.environ.get("TURN_PASSWORD", "openrelayproject")
+# TURN relay — the mesh needs one somewhere: phone and pod both sit behind NAT
+# and plain STUN hole-punch fails (RunPod NAT is symmetric). The relay rides on
+# the PHONE side (libwebrtc + metered.ca — proven combo); the pod then reaches
+# the phone's relay candidate over plain outbound UDP. Only set these if you
+# run a TURN server that aioice's client is compatible with (e.g. coturn) —
+# metered.ca rejects aioice's CHANNEL-BIND, so pod-side TURN stays OFF there.
+TURN_URLS = [u for u in os.environ.get("TURN_URLS", "").split(",") if u]
+TURN_USERNAME = os.environ.get("TURN_USERNAME", "")
+TURN_PASSWORD = os.environ.get("TURN_PASSWORD", "")
 
 
 class FrameBus:
