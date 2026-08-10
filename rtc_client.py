@@ -103,23 +103,32 @@ class RtcSubscriber:
         async def disconnect() -> None:
             print("[rtc] socket disconnected")
 
+        # Handlers take *args: depending on how the server emits, socket.io may
+        # deliver extra positional args alongside the payload dict — the payload
+        # is always the first dict we find.
+        def _payload(args) -> dict:
+            for a in args:
+                if isinstance(a, dict):
+                    return a
+            return {}
+
         @self.sio.on("offer")
-        async def on_offer(msg) -> None:
+        async def on_offer(*args) -> None:
             try:
-                await self._handle_offer(msg)
+                await self._handle_offer(_payload(args))
             except Exception as err:
                 print(f"[rtc] offer handling failed: {err}")
 
         @self.sio.on("ice-candidate")
-        async def on_ice(msg) -> None:
+        async def on_ice(*args) -> None:
             try:
-                await self._handle_ice(msg)
+                await self._handle_ice(_payload(args))
             except Exception as err:
                 print(f"[rtc] ice add failed: {err}")
 
         @self.sio.on("peer-left")
-        async def on_peer_left(msg) -> None:
-            pid = (msg or {}).get("peerId")
+        async def on_peer_left(*args) -> None:
+            pid = _payload(args).get("peerId")
             if pid in self._pcs:
                 print(f"[rtc] publisher left: {pid}")
                 await self._close_pc(pid)
