@@ -8,6 +8,8 @@ cd "$(dirname "$0")"
 echo "== [1/4] python deps =="
 pip install -q -e . 2>&1 | tail -1 || true
 pip install -q fastapi 'uvicorn[standard]' httpx onnxruntime 2>&1 | tail -1 || true
+# WebRTC subscriber: pod joins the mesh and eats the phone's real stream.
+pip install -q aiortc av "python-socketio[asyncio_client]" 2>&1 | tail -1 || true
 
 echo "== [2/4] model weights =="
 python fetch_model.py
@@ -23,6 +25,8 @@ echo "== [4/4] starting service on :8090 =="
 # Cloud GPU (4090) fits full 518 + more scale frames + denser points.
 export MAP_SCALE_FRAMES="${MAP_SCALE_FRAMES:-8}"
 export MAP_PIXEL_STRIDE="${MAP_PIXEL_STRIDE:-2}"
-# SERVER_URL must point at your PUBLICLY reachable Express (chunk push target),
-# e.g. SERVER_URL=https://sg-0sab.onrender.com — set it before running.
+# SERVER_URL must point at your PUBLICLY reachable Express — it is BOTH the
+# chunk push target AND the socket.io signaling host the WebRTC subscriber
+# joins. ROOM_ID must match the phones' room (default shipment-glasses-dev).
+export ROOM_ID="${ROOM_ID:-shipment-glasses-dev}"
 exec python -m uvicorn server:app --host 0.0.0.0 --port 8090

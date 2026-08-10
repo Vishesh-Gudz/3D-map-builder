@@ -47,6 +47,15 @@ Restart Express. Phone/viewer unchanged — "Build 3D Map" now runs on the 4090.
 | `MAP_KEYFRAME_INTERVAL` | 3 | KV-cache keyframe spacing (long sessions) |
 | `MAP_CONF_THRESHOLD` | 1.5 | drop low-confidence points |
 | `MAP_VOXEL_SIZE` | 0.03 | dedupe grid (world units) |
+| `ROOM_ID` | shipment-glasses-dev | signaling room the WebRTC subscriber joins |
+| `RTC_PEER_ID` | viewer-mapper | pod's peer id ("viewer" prefix → phones offer) |
+| `STUN_URLS` | stun:stun.l.google.com:19302 | comma-separated ICE servers |
+
+## Frame path
+During a session the pod joins the WebRTC room as one more viewer and decodes
+the phone's REAL video stream (sharp, 30fps available) — the HTTP `/frame`
+endpoint remains as a debug fallback. The pod leaves the room on stop, so the
+phone only pays the extra uplink leg while actually mapping.
 
 ## ⚠️ Cost
 RunPod bills per running hour. **STOP the pod when not mapping.** The network

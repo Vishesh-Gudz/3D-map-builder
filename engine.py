@@ -32,6 +32,8 @@ from typing import Optional
 
 import numpy as np
 import torch
+from PIL import Image
+from torchvision.transforms.functional import to_tensor
 
 from lingbot_map.models.gct_stream import GCTStream
 from lingbot_map.utils.load_fn import load_and_preprocess_images
@@ -113,6 +115,22 @@ def _preprocess_jpeg(jpeg_bytes: bytes) -> torch.Tensor:
             pass
 
 
+def _preprocess_array(rgb: np.ndarray) -> torch.Tensor:
+    """Decoded RGB frame [H,W,3] → canonical-crop tensor. Mirrors
+    load_and_preprocess_images' crop mode exactly (resize width→IMG_SIZE,
+    height to /14 multiple, center-crop overflow) — no JPEG, no disk."""
+    img = Image.fromarray(rgb)
+    w, h = img.size
+    new_w = IMG_SIZE
+    new_h = round(h * (new_w / w) / 14) * 14
+    img = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
+    t = to_tensor(img)
+    if new_h > IMG_SIZE:
+        start_y = (new_h - IMG_SIZE) // 2
+        t = t[:, start_y:start_y + IMG_SIZE, :]
+    return t
+
+
 @dataclass
 class Chunk:
     seq: int
@@ -142,18 +160,26 @@ class MapSession:
 
     # ── frame ingestion ──────────────────────────────────────────────────
     def add_frame(self, jpeg_bytes: bytes) -> list["Chunk"]:
-        """Feed one JPEG. Returns 0..N chunks (N>1 right after warmup)."""
-        if self.state == "stopped":
-            return []
-        if self.frames_in >= MAX_FRAMES:
+        """Feed one JPEG (HTTP debug path). Returns 0..N chunks."""
+        if self.state == "stopped" or self.frames_in >= MAX_FRAMES:
             return []
         self.last_frame_at = time.time()
         self.frames_in += 1
-
         t0 = time.perf_counter()
         frame = _preprocess_jpeg(jpeg_bytes)
-        t_pre = time.perf_counter()
+        return self._ingest(frame, t0, time.perf_counter())
 
+    def add_frame_array(self, rgb: np.ndarray) -> list["Chunk"]:
+        """Feed one decoded RGB frame (WebRTC path). Returns 0..N chunks."""
+        if self.state == "stopped" or self.frames_in >= MAX_FRAMES:
+            return []
+        self.last_frame_at = time.time()
+        self.frames_in += 1
+        t0 = time.perf_counter()
+        frame = _preprocess_array(rgb)
+        return self._ingest(frame, t0, time.perf_counter())
+
+    def _ingest(self, frame: torch.Tensor, t0: float, t_pre: float) -> list["Chunk"]:
         if self.state == "warming":
             self.warm_buffer.append(frame)
             if len(self.warm_buffer) < NUM_SCALE_FRAMES:

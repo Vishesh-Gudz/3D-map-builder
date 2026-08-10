@@ -31,20 +31,43 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 import engine
+from rtc_client import RtcSubscriber
 
 SERVER_URL = os.environ.get("SERVER_URL", "")  # e.g. http://localhost:3001
 IDLE_TIMEOUT_SEC = int(os.environ.get("MAP_IDLE_TIMEOUT", "60"))
 CHUNK_BUFFER_MAX = 500
+# WebRTC subscriber: the pod joins the signaling room (same Express host as
+# SERVER_URL) and consumes the phone's real video stream during a session.
+ROOM_ID = os.environ.get("ROOM_ID", "shipment-glasses-dev")
+RTC_PEER_ID = os.environ.get("RTC_PEER_ID", "viewer-mapper")  # "viewer" prefix → phones auto-offer
+STUN_URLS = [u for u in os.environ.get(
+    "STUN_URLS", "stun:stun.l.google.com:19302").split(",") if u]
 
 app = FastAPI(title="sg-map-builder")
 
 _session: Optional[engine.MapSession] = None
 _chunk_buffer: list[dict] = []
 _push_client = httpx.AsyncClient(timeout=10)
-# Chunks leave through a background worker so the /frame handler returns the
-# moment inference is done — the pod→Express push must not hold up the next
-# frame (Express gates uploads on our response).
+# Chunks leave through a background worker so the capture loop returns to the
+# GPU the moment inference is done — the pod→Express push must not hold up the
+# next frame.
 _push_queue: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=200)
+_rtc: Optional[RtcSubscriber] = None
+_capture_task: Optional[asyncio.Task] = None
+
+
+def _enqueue_chunks(s: engine.MapSession, chunks: list) -> int:
+    """Buffer + queue chunk payloads for background delivery. Returns new pts."""
+    payloads = [_chunk_payload(s, c) for c in chunks]
+    for p in payloads:
+        _chunk_buffer.append(p)
+        if len(_chunk_buffer) > CHUNK_BUFFER_MAX:
+            _chunk_buffer.pop(0)
+        try:
+            _push_queue.put_nowait(p)
+        except asyncio.QueueFull:
+            print(f"[server] push queue full — dropping seq {p['seq']}")
+    return sum(c.count for c in chunks)
 
 
 def _chunk_payload(session: engine.MapSession, chunk: engine.Chunk) -> dict:
@@ -81,6 +104,60 @@ async def _push_worker() -> None:
                   f"(queue {_push_queue.qsize()})")
 
 
+async def _capture_loop(s: engine.MapSession) -> None:
+    """WebRTC frame path: pull the freshest decoded frame at GPU pace. The bus
+    always holds the latest video frame, so the model never eats a backlog —
+    it samples the stream exactly as fast as it can infer (~7fps on a 4090)."""
+    assert _rtc is not None
+    last_ts = 0.0
+    last_status = 0.0
+    started = time.time()
+    print(f"[capture] loop up for {s.peer_id} — waiting for stream")
+    while _session is s and s.state != "stopped":
+        slot = _rtc.bus.get(s.peer_id)
+        if slot is None or slot[1] <= last_ts:
+            if last_ts == 0.0 and time.time() - started > 30:
+                print("[capture] no frames after 30s — phone streaming? NAT ok?")
+                started = time.time()
+            await asyncio.sleep(0.02)
+            continue
+        arr, last_ts = slot
+        t0 = time.perf_counter()
+        chunks = await asyncio.to_thread(s.add_frame_array, arr)
+        new_pts = _enqueue_chunks(s, chunks)
+        # Express no longer sees frames (no tee), so the viewer's frame/point
+        # counters ride the push channel as throttled status messages.
+        if time.time() - last_status >= 1.0:
+            last_status = time.time()
+            try:
+                _push_queue.put_nowait({
+                    "sessionId": s.session_id, "peerId": s.peer_id,
+                    "status": {"state": s.state, "frames": s.frames_mapped,
+                               "points": s.total_points},
+                })
+            except asyncio.QueueFull:
+                pass
+        if new_pts:
+            print(f"[capture {s.frames_mapped}] "
+                  f"infer {1000 * (time.perf_counter() - t0):.0f}ms | "
+                  f"+{new_pts} pts | queue {_push_queue.qsize()}")
+    print(f"[capture] loop done for {s.peer_id} ({s.frames_mapped} frames)")
+
+
+async def _teardown_rtc() -> None:
+    """Stop the capture loop and leave the room (frees the phone's uplink)."""
+    global _capture_task
+    if _capture_task is not None:
+        _capture_task.cancel()
+        try:
+            await _capture_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _capture_task = None
+    if _rtc is not None:
+        await _rtc.stop()
+
+
 @app.on_event("startup")
 async def _boot() -> None:
     # Load the model up front so the first session doesn't eat the delay.
@@ -99,6 +176,7 @@ async def _idle_reaper() -> None:
             print(f"[server] session {s.session_id} idle → auto-stop")
             stats = await asyncio.to_thread(s.finalize)
             _session = None
+            await _teardown_rtc()
             if SERVER_URL:
                 try:
                     await _push_client.post(
@@ -125,13 +203,26 @@ async def health() -> dict:
 
 @app.post("/session/start")
 async def start(body: dict) -> dict:
-    global _session, _chunk_buffer
+    global _session, _chunk_buffer, _rtc, _capture_task
     peer_id = str(body.get("peerId", "unknown"))
     if _session is not None and _session.state != "stopped":
         # One live session (Phase A) — restart replaces it.
         await asyncio.to_thread(_session.finalize)
+    await _teardown_rtc()
     _session = engine.new_session(peer_id)
     _chunk_buffer = []
+
+    # Join the WebRTC room and consume the phone's real stream. Falls back to
+    # the HTTP /frame path (old JPEG lane) if signaling is unreachable.
+    if SERVER_URL:
+        if _rtc is None:
+            _rtc = RtcSubscriber(SERVER_URL, ROOM_ID, RTC_PEER_ID, STUN_URLS)
+        try:
+            await _rtc.start()
+            _capture_task = asyncio.create_task(_capture_loop(_session))
+        except Exception as err:
+            print(f"[server] rtc connect failed ({err}) — HTTP frame path only")
+
     print(f"[server] session {_session.session_id} started for {peer_id}")
     return {"sessionId": _session.session_id, "state": _session.state}
 
@@ -153,17 +244,7 @@ async def frame(session_id: str, request: Request) -> dict:
     chunks = await asyncio.to_thread(s.add_frame, jpeg)
     t_infer = time.perf_counter()
 
-    payloads = [_chunk_payload(s, c) for c in chunks]
-    for p in payloads:
-        _chunk_buffer.append(p)
-        if len(_chunk_buffer) > CHUNK_BUFFER_MAX:
-            _chunk_buffer.pop(0)
-        try:
-            _push_queue.put_nowait(p)  # background worker delivers, in order
-        except asyncio.QueueFull:
-            print(f"[server] push queue full — dropping seq {p['seq']}")
-
-    new_pts = sum(c.count for c in chunks)
+    new_pts = _enqueue_chunks(s, chunks)
     print(f"[frame {s.frames_mapped}] recv {1000 * (t_recv - t0):.0f}ms | "
           f"infer {1000 * (t_infer - t_recv):.0f}ms | +{new_pts} pts | "
           f"queue {_push_queue.qsize()}")
@@ -173,7 +254,7 @@ async def frame(session_id: str, request: Request) -> dict:
         "state": s.state,
         "framesMapped": s.frames_mapped,
         "points": s.total_points,
-        "chunks": len(payloads),
+        "chunks": len(chunks),
     }
 
 
@@ -204,5 +285,6 @@ async def stop(session_id: str) -> dict:
         raise HTTPException(404, "no such session")
     stats = await asyncio.to_thread(s.finalize)
     _session = None
+    await _teardown_rtc()
     print(f"[server] session {session_id} stopped: {stats}")
     return stats
