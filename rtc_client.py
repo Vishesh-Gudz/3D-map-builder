@@ -29,6 +29,46 @@ from aiortc import (
 )
 from aiortc.sdp import candidate_from_sdp
 
+# ── aioice TURN auth patch ───────────────────────────────────────────────────
+# Some TURN services (metered.ca among them) rotate the auth nonce and answer
+# later requests (e.g. CHANNEL-BIND) with a 401 that carries a fresh NONCE but
+# NO REALM attribute. Stock aioice only retries a 401 when REALM is present
+# (turn.py request_with_retry), so the bind fails and ICE never completes.
+# Patch: retry any 401/438 that carries a NONCE, reusing the known realm.
+import aioice.stun as _stun
+import aioice.turn as _turn
+
+
+async def _request_with_retry(self, request):
+    try:
+        return await self.request(request)
+    except _stun.TransactionFailed as e:
+        attrs = e.response.attributes
+        code = attrs.get("ERROR-CODE", (0, ""))[0]
+        print(f"[rtc] turn {request.message_method} -> {code}, "
+              f"attrs={sorted(attrs.keys())} — retrying with fresh nonce")
+        if (
+            code in (401, 438)
+            and "NONCE" in attrs
+            and self.username is not None
+            and self.password is not None
+        ):
+            self.nonce = attrs["NONCE"]
+            if "REALM" in attrs:
+                self.realm = attrs["REALM"]
+            if self.realm is None:
+                raise  # cannot compute the long-term key without a realm
+            self.integrity_key = _turn.make_integrity_key(
+                self.username, self.realm, self.password
+            )
+            request.transaction_id = _turn.random_transaction_id()
+            return await self.request(request)
+        raise
+
+
+_turn.TurnClientMixin.request_with_retry = _request_with_retry
+# ─────────────────────────────────────────────────────────────────────────────
+
 # TURN relay — REQUIRED in practice: the phone and the pod both sit behind NAT
 # (home WiFi + RunPod container) and plain STUN hole-punch fails. TURN on THIS
 # side alone is enough: the phone can always reach the TURN server's public
