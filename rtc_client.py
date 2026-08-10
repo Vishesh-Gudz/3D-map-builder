@@ -16,6 +16,7 @@ code, never the mapping loop.
 """
 
 import asyncio
+import os
 import time
 from typing import Optional
 
@@ -27,6 +28,18 @@ from aiortc import (
     RTCSessionDescription,
 )
 from aiortc.sdp import candidate_from_sdp
+
+# TURN relay — REQUIRED in practice: the phone and the pod both sit behind NAT
+# (home WiFi + RunPod container) and plain STUN hole-punch fails. TURN on THIS
+# side alone is enough: the phone can always reach the TURN server's public
+# address, so media flows phone↔TURN↔pod. Defaults are the free OpenRelay
+# service; override with your own coturn for production.
+TURN_URLS = [u for u in os.environ.get(
+    "TURN_URLS",
+    "turn:openrelay.metered.ca:80,turn:openrelay.metered.ca:443",
+).split(",") if u]
+TURN_USERNAME = os.environ.get("TURN_USERNAME", "openrelayproject")
+TURN_PASSWORD = os.environ.get("TURN_PASSWORD", "openrelayproject")
 
 
 class FrameBus:
@@ -144,9 +157,12 @@ class RtcSubscriber:
         print(f"[rtc] offer from {publisher}")
         await self._close_pc(publisher)  # renegotiation replaces the old leg
 
-        pc = RTCPeerConnection(
-            RTCConfiguration(iceServers=[RTCIceServer(urls=u) for u in self.stun_urls])
-        )
+        ice_servers = [RTCIceServer(urls=u) for u in self.stun_urls]
+        if TURN_URLS:
+            ice_servers.append(RTCIceServer(
+                urls=TURN_URLS, username=TURN_USERNAME, credential=TURN_PASSWORD,
+            ))
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
         self._pcs[publisher] = pc
 
         @pc.on("track")
@@ -160,6 +176,10 @@ class RtcSubscriber:
             print(f"[rtc] {publisher} connection: {pc.connectionState}")
             if pc.connectionState in ("failed", "closed"):
                 await self._close_pc(publisher)
+
+        @pc.on("iceconnectionstatechange")
+        async def on_ice_state() -> None:
+            print(f"[rtc] {publisher} ice: {pc.iceConnectionState}")
 
         await pc.setRemoteDescription(
             RTCSessionDescription(sdp=desc["sdp"], type=desc["type"])
