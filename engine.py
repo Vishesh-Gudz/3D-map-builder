@@ -45,8 +45,12 @@ MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(os.path.dirname(__file__)
 # interpolation; smaller inputs break internal token reshapes). VRAM control
 # comes from bf16 + kv sliding window + camera_iters=1 instead.
 IMG_SIZE = int(os.environ.get("MAP_IMG_SIZE", "518"))
-NUM_SCALE_FRAMES = int(os.environ.get("MAP_SCALE_FRAMES", "4"))
-KEYFRAME_INTERVAL = int(os.environ.get("MAP_KEYFRAME_INTERVAL", "3"))
+NUM_SCALE_FRAMES = int(os.environ.get("MAP_SCALE_FRAMES", "8"))
+# 1 = every frame anchored in the KV cache (demo.py's value for <320-frame
+# runs). Higher trades pose accuracy for cache memory — do NOT raise for
+# quality-sensitive maps.
+KEYFRAME_INTERVAL = int(os.environ.get("MAP_KEYFRAME_INTERVAL", "1"))
+CAMERA_ITERS = int(os.environ.get("MAP_CAMERA_ITERS", "4"))  # demo default; 1 = fast/inaccurate
 CONF_THRESHOLD = float(os.environ.get("MAP_CONF_THRESHOLD", "1.5"))
 PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nth pixel
 VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.03"))   # world-unit dedupe grid
@@ -88,7 +92,7 @@ def load_model() -> GCTStream:
         kv_cache_cross_frame_special=True,
         kv_cache_include_scale_frames=True,
         use_sdpa=True,               # no FlashInfer/Triton dependency
-        camera_num_iterations=1,     # speed over marginal pose accuracy
+        camera_num_iterations=CAMERA_ITERS,  # 4 = demo pose accuracy (fuses geometry)
     )
     ckpt = torch.load(MODEL_PATH, map_location=_DEVICE, weights_only=False)
     state_dict = ckpt.get("model", ckpt)
@@ -150,41 +154,41 @@ class Chunk:
 class MapSession:
     session_id: str
     peer_id: str
-    state: str = "warming"   # warming | streaming | stopped
+    state: str = "capturing"   # capturing | processing | stopped
     frames_in: int = 0
     frames_mapped: int = 0
     total_points: int = 0
     seq: int = 0
-    warm_buffer: list = field(default_factory=list)
+    # Buffer of preprocessed frames (CPU tensors), assembled into the clip that
+    # inference_streaming consumes on stop — same as demo.py loading a video.
+    frames_buf: list = field(default_factory=list)
     voxels: set = field(default_factory=set)
-    # accumulated cloud for the PLY (grows with dedeuped points only)
     acc_xyz: list = field(default_factory=list)
     acc_rgb: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_frame_at: float = field(default_factory=time.time)
 
-    # ── frame ingestion ──────────────────────────────────────────────────
+    # ── frame ingestion (buffer only — no inference during capture) ───────
     def add_frame(self, jpeg_bytes: bytes) -> list["Chunk"]:
-        """Feed one JPEG (HTTP debug path). Returns 0..N chunks."""
-        if self.state == "stopped" or self.frames_in >= MAX_FRAMES:
+        """Feed one JPEG (HTTP debug path). Buffers; returns no chunks."""
+        if self.state != "capturing" or self.frames_in >= MAX_FRAMES:
             return []
         self.last_frame_at = time.time()
         self.frames_in += 1
-        t0 = time.perf_counter()
-        frame = _preprocess_jpeg(jpeg_bytes)
-        return self._ingest(frame, t0, time.perf_counter())
+        self.frames_buf.append(_preprocess_jpeg(jpeg_bytes))
+        return []
 
     def add_frame_array(self, rgb: np.ndarray) -> list["Chunk"]:
-        """Feed one decoded RGB frame (WebRTC path). Returns 0..N chunks."""
-        if self.state == "stopped" or self.frames_in >= MAX_FRAMES:
+        """Feed one decoded RGB frame (WebRTC path). Buffers; no chunks yet —
+        the whole clip is reconstructed together on stop (demo.py parity)."""
+        if self.state != "capturing" or self.frames_in >= MAX_FRAMES:
             return []
         self.last_frame_at = time.time()
         self.frames_in += 1
         if DEBUG_DUMP and self.frames_in % DEBUG_EVERY == 0:
             self._dump_frame(rgb)
-        t0 = time.perf_counter()
-        frame = _preprocess_array(rgb)
-        return self._ingest(frame, t0, time.perf_counter())
+        self.frames_buf.append(_preprocess_array(rgb))
+        return []
 
     def _dump_frame(self, rgb: np.ndarray) -> None:
         """Save the raw received frame as JPEG — what WebRTC actually delivered
@@ -197,74 +201,69 @@ class MapSession:
         except Exception as err:
             print(f"[debug] frame dump failed: {err}")
 
-    def _ingest(self, frame: torch.Tensor, t0: float, t_pre: float) -> list["Chunk"]:
-        if self.state == "warming":
-            self.warm_buffer.append(frame)
-            if len(self.warm_buffer) < NUM_SCALE_FRAMES:
-                return []
-            # Phase 1 — scale block: all warm frames in one bidirectional pass.
-            model = load_model()
-            block = torch.stack(self.warm_buffer, dim=0).unsqueeze(0).to(_DEVICE)
-            with _infer_lock, torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
-                model.clean_kv_cache()
-                out = model.forward(
-                    block,
-                    num_frame_for_scale=NUM_SCALE_FRAMES,
-                    num_frame_per_block=NUM_SCALE_FRAMES,
-                    causal_inference=True,
-                )
-                chunks = [
-                    self._emit(out, block, s)
-                    for s in range(NUM_SCALE_FRAMES)
-                ]
-            self.warm_buffer = []
-            self.state = "streaming"
-            return [c for c in chunks if c is not None]
-
-        # streaming: one forward per frame, keyframe policy bounds the cache.
+    # ── reconstruction (demo.py's inference_streaming, run on the clip) ────
+    def process(self) -> list["Chunk"]:
+        """Run the OFFICIAL streaming reconstruction over the buffered clip,
+        exactly like demo.py: Phase-1 scale block, then frame-by-frame with the
+        KV cache and full camera-pose refinement. Returns per-frame chunks for
+        the viewer. This is where geometry is actually built."""
+        if not self.frames_buf:
+            return []
+        self.state = "processing"
         model = load_model()
-        stream_idx = self.frames_mapped - NUM_SCALE_FRAMES
-        is_keyframe = KEYFRAME_INTERVAL <= 1 or (stream_idx % KEYFRAME_INTERVAL == 0)
-        frame_b = frame.unsqueeze(0).unsqueeze(0).to(_DEVICE)  # [1,1,3,H,W]
+        # Pad any odd-aspect frame to the modal shape so torch.stack succeeds
+        # (phone is portrait → nearly all frames are already 518x518).
+        shapes = {tuple(f.shape) for f in self.frames_buf}
+        if len(shapes) > 1:
+            h = max(f.shape[1] for f in self.frames_buf)
+            w = max(f.shape[2] for f in self.frames_buf)
+            self.frames_buf = [
+                torch.nn.functional.pad(
+                    f, (0, w - f.shape[2], 0, h - f.shape[1]), value=1.0)
+                for f in self.frames_buf
+            ]
+        images = torch.stack(self.frames_buf, dim=0).unsqueeze(0)  # [1,S,3,H,W] CPU
+        self.frames_buf = []
+        S = images.shape[1]
+        t0 = time.time()
+        print(f"[engine] reconstructing {S} frames (inference_streaming, "
+              f"scale={NUM_SCALE_FRAMES}, keyframe={KEYFRAME_INTERVAL}, "
+              f"cam_iters={CAMERA_ITERS})…")
         with _infer_lock, torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
-            if not is_keyframe:
-                model._set_skip_append(True)
-            out = model.forward(
-                frame_b,
-                num_frame_for_scale=NUM_SCALE_FRAMES,
-                num_frame_per_block=1,
-                causal_inference=True,
+            preds = model.inference_streaming(
+                images,
+                num_scale_frames=NUM_SCALE_FRAMES,
+                keyframe_interval=KEYFRAME_INTERVAL,
+                output_device=torch.device("cpu"),
             )
-            if not is_keyframe:
-                model._set_skip_append(False)
-            t_fwd = time.perf_counter()
-            chunk = self._emit(out, frame_b, 0)
-        t_emit = time.perf_counter()
-        print(f"[engine] pre {1000 * (t_pre - t0):.0f}ms | "
-              f"fwd {1000 * (t_fwd - t_pre):.0f}ms | "
-              f"emit {1000 * (t_emit - t_fwd):.0f}ms")
-        return [chunk] if chunk is not None else []
+        pose_enc = preds["pose_enc"]        # [1,S,9]
+        depth = preds["depth"]              # [1,S,H,W,1]
+        depth_conf = preds["depth_conf"]    # [1,S,H,W]
+        print(f"[engine] inference done in {time.time() - t0:.1f}s — extracting")
 
-    # ── point extraction ─────────────────────────────────────────────────
-    def _emit(self, out: dict, images_block: torch.Tensor, s: int) -> Optional[Chunk]:
-        """One frame's predictions → conf filter → stride → voxel dedupe → chunk."""
+        chunks: list[Chunk] = []
+        for s in range(S):
+            # Unproject one frame at a time to bound peak memory.
+            with _infer_lock, torch.no_grad():
+                wp_t = model._unproject_depth_to_world(
+                    depth[:, s:s + 1].float().to(_DEVICE),
+                    pose_enc[:, s:s + 1].float().to(_DEVICE),
+                )
+            wp = wp_t[0, 0].float().cpu().numpy()                       # [H,W,3]
+            conf = depth_conf[0, s].float().numpy()                    # [H,W]
+            rgb = (images[0, s].float().numpy().transpose(1, 2, 0) * 255
+                   ).clip(0, 255).astype(np.uint8)                     # [H,W,3]
+            chunk = self._points_to_chunk(wp, conf, rgb, pose_enc[:, s:s + 1])
+            if chunk is not None:
+                chunks.append(chunk)
+        print(f"[engine] extracted {self.total_points} points in {len(chunks)} chunks")
+        return chunks
+
+    def _points_to_chunk(
+        self, wp: np.ndarray, conf: np.ndarray, rgb: np.ndarray, pose_enc_f,
+    ) -> Optional[Chunk]:
+        """One frame's world points → stride → conf filter → voxel dedupe → chunk."""
         self.frames_mapped += 1
-        # GCTStream ships with enable_point=False — the official pipeline derives
-        # world points by unprojecting DEPTH through the predicted pose (same as
-        # demo_render's --keyframes_only_points). The model provides the helper.
-        if "depth" not in out or "depth_conf" not in out:
-            return None
-        model = _model
-        assert model is not None
-        wp_t = model._unproject_depth_to_world(
-            out["depth"].float(), out["pose_enc"].float()
-        )                                                              # [B,S,H,W,3]
-        wp = wp_t[0, s].float().cpu().numpy()                          # [H,W,3]
-        conf = out["depth_conf"][0, s].float().cpu().numpy()           # [H,W]
-        rgb = (
-            images_block[0, s].float().cpu().numpy().transpose(1, 2, 0) * 255
-        ).clip(0, 255).astype(np.uint8)                                # [H,W,3]
-
         st = PIXEL_STRIDE
         wp_s = wp[::st, ::st].reshape(-1, 3)
         conf_s = conf[::st, ::st].reshape(-1)
@@ -275,8 +274,6 @@ class MapSession:
         if wp_s.shape[0] == 0:
             return None
 
-        # Voxel dedupe: only voxels never seen in this session pass through —
-        # re-walking an aisle adds ~nothing; map size is bounded by the SPACE.
         vox = np.floor(wp_s / VOXEL_SIZE).astype(np.int64)
         keys = vox[:, 0] * 73856093 ^ vox[:, 1] * 19349663 ^ vox[:, 2] * 83492791
         new_mask = np.fromiter(
@@ -287,12 +284,9 @@ class MapSession:
         if wp_new.shape[0] == 0:
             return None
 
-        # Camera pose (c2w 4x4) for the trajectory trail.
         pose_mat = [0.0] * 16
         try:
-            extri, _ = pose_encoding_to_extri_intri(
-                out["pose_enc"][:, s:s + 1], images_block.shape[-2:]
-            )
+            extri, _ = pose_encoding_to_extri_intri(pose_enc_f, (wp.shape[0], wp.shape[1]))
             e = np.eye(4, dtype=np.float32)
             e[:3, :4] = extri[0, 0].float().cpu().numpy()
             pose_mat = np.linalg.inv(e).reshape(-1).tolist()  # w2c → c2w
