@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 echo "== [1/4] python deps =="
 export PIP_BREAK_SYSTEM_PACKAGES=1
 pip install -q --ignore-installed -e .
-pip install -q --ignore-installed fastapi 'uvicorn[standard]' httpx onnxruntime aiortc av "python-socketio[asyncio_client]"
+pip install -q --ignore-installed fastapi 'uvicorn[standard]' httpx onnxruntime aiortc av "python-socketio[asyncio_client]" python-multipart opencv-python-headless
 
 echo "== [2/4] model weights =="
 python fetch_model.py

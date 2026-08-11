@@ -29,7 +29,8 @@ from typing import Optional
 import glob
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import engine
@@ -45,7 +46,19 @@ RTC_PEER_ID = os.environ.get("RTC_PEER_ID", "viewer-mapper")  # "viewer" prefix 
 STUN_URLS = [u for u in os.environ.get(
     "STUN_URLS", "stun:stun.l.google.com:19302").split(",") if u]
 
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR",
+                            os.path.join(os.path.dirname(__file__), "uploads"))
+VIDEO_FPS = int(os.environ.get("MAP_VIDEO_FPS", "10"))  # demo.py's sampling rate
+
 app = FastAPI(title="sg-map-builder")
+# The browser uploads videos straight to the pod (bypassing Express — the file
+# is far too big to relay) and polls for chunks, so it needs CORS.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _session: Optional[engine.MapSession] = None
 _chunk_buffer: list[dict] = []
@@ -303,6 +316,95 @@ async def debug_frame(name: str) -> FileResponse:
     if not os.path.isfile(path):
         raise HTTPException(404, "no such frame")
     return FileResponse(path, media_type="image/jpeg")
+
+
+# ── Video upload path ────────────────────────────────────────────────────────
+# Self-contained alternative to live WebRTC mapping: upload a clip, the pod
+# reconstructs it with demo.py's exact pipeline, the browser polls the chunks
+# and renders them in the same three.js pane. Full-resolution input, so none of
+# the live path's bandwidth/NAT constraints apply.
+
+_jobs: dict[str, dict] = {}
+
+
+def _run_video_job(job_id: str, path: str) -> None:
+    """Decode → reconstruct → chunks. Runs in a worker thread."""
+    job = _jobs[job_id]
+    session = engine.MapSession(session_id=job_id, peer_id="upload")
+    try:
+        job["state"] = "decoding"
+        images = engine.load_video_frames(path, fps=VIDEO_FPS)
+        job["frames"] = int(images.shape[1])
+        job["state"] = "reconstructing"
+        chunks = session.process(images=images)
+        job["state"] = "extracting"
+        job["chunks"] = [_chunk_payload(session, c) for c in chunks]
+        job["stats"] = session.finalize()
+        job["points"] = session.total_points
+        job["state"] = "done"
+        print(f"[video] job {job_id} done: {job['points']} points")
+    except Exception as err:
+        import traceback
+        traceback.print_exc()
+        job["state"] = "error"
+        job["error"] = str(err)[:300]
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+@app.post("/video/upload")
+async def video_upload(file: UploadFile = File(...)) -> dict:
+    if engine._model is None:
+        raise HTTPException(503, "model still loading")
+    job_id = engine.uuid.uuid4().hex[:12]
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    ext = os.path.splitext(file.filename or "")[1][:8] or ".mp4"
+    path = os.path.join(UPLOAD_DIR, f"{job_id}{ext}")
+    size = 0
+    with open(path, "wb") as f:
+        while True:
+            block = await file.read(1 << 20)
+            if not block:
+                break
+            f.write(block)
+            size += len(block)
+    print(f"[video] job {job_id} received {size / 1e6:.1f} MB ({file.filename})")
+    _jobs[job_id] = {"state": "queued", "frames": 0, "points": 0,
+                     "chunks": [], "stats": None, "error": None}
+    # One GPU, one job at a time — the model lock inside the engine serialises
+    # anyway; a thread keeps the event loop free to serve status polls.
+    threading.Thread(target=_run_video_job, args=(job_id, path), daemon=True).start()
+    return {"jobId": job_id, "sizeBytes": size}
+
+
+@app.get("/video/{job_id}/status")
+async def video_status(job_id: str) -> dict:
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "no such job")
+    return {
+        "jobId": job_id, "state": job["state"], "frames": job["frames"],
+        "points": job["points"], "chunks": len(job["chunks"]),
+        "error": job["error"], "stats": job["stats"],
+    }
+
+
+@app.get("/video/{job_id}/chunks")
+async def video_chunks(job_id: str, since: int = 0, limit: int = 40) -> JSONResponse:
+    """Paged chunk pull — the browser appends each page to the point cloud."""
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "no such job")
+    page = job["chunks"][since:since + limit]
+    return JSONResponse({
+        "state": job["state"],
+        "total": len(job["chunks"]),
+        "next": since + len(page),
+        "chunks": page,
+    })
 
 
 @app.get("/maps/{session_id}.ply")

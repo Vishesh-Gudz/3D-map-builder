@@ -206,28 +206,31 @@ class MapSession:
             print(f"[debug] frame dump failed: {err}")
 
     # ── reconstruction (demo.py's inference_streaming, run on the clip) ────
-    def process(self) -> list["Chunk"]:
-        """Run the OFFICIAL streaming reconstruction over the buffered clip,
-        exactly like demo.py: Phase-1 scale block, then frame-by-frame with the
-        KV cache and full camera-pose refinement. Returns per-frame chunks for
-        the viewer. This is where geometry is actually built."""
-        if not self.frames_buf:
-            return []
+    def process(self, images: Optional[torch.Tensor] = None) -> list["Chunk"]:
+        """Run the OFFICIAL streaming reconstruction over a clip, exactly like
+        demo.py: Phase-1 scale block, then frame-by-frame with the KV cache and
+        full camera-pose refinement. Returns per-frame chunks for the viewer.
+
+        `images` [1,S,3,H,W] comes from a decoded video (upload path); when
+        omitted the buffered WebRTC frames are used instead."""
+        if images is None:
+            if not self.frames_buf:
+                return []
+            # Pad any odd-aspect frame to the modal shape so torch.stack
+            # succeeds (phone is portrait → nearly all frames are 518x518).
+            shapes = {tuple(f.shape) for f in self.frames_buf}
+            if len(shapes) > 1:
+                h = max(f.shape[1] for f in self.frames_buf)
+                w = max(f.shape[2] for f in self.frames_buf)
+                self.frames_buf = [
+                    torch.nn.functional.pad(
+                        f, (0, w - f.shape[2], 0, h - f.shape[1]), value=1.0)
+                    for f in self.frames_buf
+                ]
+            images = torch.stack(self.frames_buf, dim=0).unsqueeze(0)  # [1,S,3,H,W]
+            self.frames_buf = []
         self.state = "processing"
         model = load_model()
-        # Pad any odd-aspect frame to the modal shape so torch.stack succeeds
-        # (phone is portrait → nearly all frames are already 518x518).
-        shapes = {tuple(f.shape) for f in self.frames_buf}
-        if len(shapes) > 1:
-            h = max(f.shape[1] for f in self.frames_buf)
-            w = max(f.shape[2] for f in self.frames_buf)
-            self.frames_buf = [
-                torch.nn.functional.pad(
-                    f, (0, w - f.shape[2], 0, h - f.shape[1]), value=1.0)
-                for f in self.frames_buf
-            ]
-        images = torch.stack(self.frames_buf, dim=0).unsqueeze(0)  # [1,S,3,H,W] CPU
-        self.frames_buf = []
         S = images.shape[1]
         t0 = time.time()
         print(f"[engine] reconstructing {S} frames (inference_streaming, "
@@ -386,6 +389,56 @@ def _write_ply(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
         for i in range(n):
             f.write(struct.pack("<fffBBB", xyz[i, 0], xyz[i, 1], xyz[i, 2],
                                 rgb[i, 0], rgb[i, 1], rgb[i, 2]))
+
+
+def load_video_frames(video_path: str, fps: int = 10) -> torch.Tensor:
+    """Decode an uploaded video into demo.py's preprocessed tensor.
+
+    Byte-for-byte demo.py's path: sample every Nth frame to hit `fps`, write
+    JPEGs, then run them through load_and_preprocess_images. Uploaded video
+    keeps its full resolution — no WebRTC downscaling — which is exactly what
+    the reconstruction needs to recover camera motion.
+    """
+    import cv2  # heavy import, only needed for the upload path
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("could not open video")
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    interval = max(1, round(src_fps / max(1, fps)))
+    out_dir = tempfile.mkdtemp(prefix="lingbot_video_")
+    paths: list[str] = []
+    idx = 0
+    try:
+        while len(paths) < MAX_FRAMES:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % interval == 0:
+                p = os.path.join(out_dir, f"{len(paths):06d}.jpg")
+                cv2.imwrite(p, frame)
+                paths.append(p)
+            idx += 1
+    finally:
+        cap.release()
+    if not paths:
+        raise ValueError("no frames decoded from video")
+    print(f"[engine] decoded {len(paths)} frames from video "
+          f"(src {src_fps:.1f}fps, every {interval})")
+    images = load_and_preprocess_images(
+        paths, mode="crop", image_size=IMG_SIZE, patch_size=14)
+    for p in paths:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    try:
+        os.rmdir(out_dir)
+    except OSError:
+        pass
+    if images.dim() == 4:
+        images = images.unsqueeze(0)          # [1,S,3,H,W]
+    return images
 
 
 def new_session(peer_id: str) -> MapSession:
