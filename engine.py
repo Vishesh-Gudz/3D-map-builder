@@ -36,6 +36,10 @@ from PIL import Image
 from torchvision.transforms.functional import to_tensor
 
 from lingbot_map.models.gct_stream import GCTStream
+from lingbot_map.utils.geometry import (
+    closed_form_inverse_se3_general,
+    depth_to_world_coords_points,
+)
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -241,26 +245,39 @@ class MapSession:
         depth_conf = preds["depth_conf"]    # [1,S,H,W]
         print(f"[engine] inference done in {time.time() - t0:.1f}s — extracting")
 
+        # EXACT demo.py → viser composition. pose_encoding_to_extri_intri returns
+        # the camera-TO-world matrix; demo's postprocess inverts it and the
+        # geometry helper inverts it back before applying. Do NOT shortcut this
+        # with model._unproject_depth_to_world — that applies the INVERSE
+        # transform (points scatter, dedupe never hits, trail collapses).
+        hw = tuple(images.shape[-2:])
+        extri, intri = pose_encoding_to_extri_intri(pose_enc.float(), hw)  # [1,S,3,4]/[1,S,3,3]
+        c2w = torch.zeros((*extri.shape[:-2], 4, 4), dtype=extri.dtype)
+        c2w[..., :3, :4] = extri
+        c2w[..., 3, 3] = 1.0
+        w2c = closed_form_inverse_se3_general(c2w)[..., :3, :4]  # what demo stores as "extrinsic"
+        w2c_np = w2c[0].cpu().numpy()
+        intri_np = intri[0].cpu().numpy()
+        c2w_np = c2w[0].cpu().numpy()
+
         chunks: list[Chunk] = []
         for s in range(S):
-            # Unproject one frame at a time to bound peak memory.
-            with _infer_lock, torch.no_grad():
-                wp_t = model._unproject_depth_to_world(
-                    depth[:, s:s + 1].float().to(_DEVICE),
-                    pose_enc[:, s:s + 1].float().to(_DEVICE),
-                )
-            wp = wp_t[0, 0].float().cpu().numpy()                       # [H,W,3]
+            # Per-frame unprojection keeps peak memory at one frame.
+            wp, _, _ = depth_to_world_coords_points(
+                depth[0, s].float().numpy().squeeze(-1),  # [H,W]
+                w2c_np[s], intri_np[s],
+            )                                                          # [H,W,3]
             conf = depth_conf[0, s].float().numpy()                    # [H,W]
             rgb = (images[0, s].float().numpy().transpose(1, 2, 0) * 255
                    ).clip(0, 255).astype(np.uint8)                     # [H,W,3]
-            chunk = self._points_to_chunk(wp, conf, rgb, pose_enc[:, s:s + 1])
+            chunk = self._points_to_chunk(wp, conf, rgb, c2w_np[s])
             if chunk is not None:
                 chunks.append(chunk)
         print(f"[engine] extracted {self.total_points} points in {len(chunks)} chunks")
         return chunks
 
     def _points_to_chunk(
-        self, wp: np.ndarray, conf: np.ndarray, rgb: np.ndarray, pose_enc_f,
+        self, wp: np.ndarray, conf: np.ndarray, rgb: np.ndarray, c2w: np.ndarray,
     ) -> Optional[Chunk]:
         """One frame's world points → stride → conf filter → voxel dedupe → chunk."""
         self.frames_mapped += 1
@@ -284,14 +301,9 @@ class MapSession:
         if wp_new.shape[0] == 0:
             return None
 
-        pose_mat = [0.0] * 16
-        try:
-            extri, _ = pose_encoding_to_extri_intri(pose_enc_f, (wp.shape[0], wp.shape[1]))
-            e = np.eye(4, dtype=np.float32)
-            e[:3, :4] = extri[0, 0].float().cpu().numpy()
-            pose_mat = np.linalg.inv(e).reshape(-1).tolist()  # w2c → c2w
-        except Exception:
-            pass
+        # Camera-to-world for the trail — same matrix the viser viewer uses for
+        # frustums (cam_to_world_mat = inverse of the stored "extrinsic").
+        pose_mat = np.asarray(c2w, dtype=np.float32).reshape(-1).tolist()
 
         self.acc_xyz.append(wp_new.astype(np.float32))
         self.acc_rgb.append(rgb_new)
