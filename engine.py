@@ -52,6 +52,11 @@ PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nt
 VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.03"))   # world-unit dedupe grid
 MAX_FRAMES = int(os.environ.get("MAP_MAX_FRAMES", "2000"))
 MAPS_DIR = os.environ.get("MAPS_DIR", os.path.join(os.path.dirname(__file__), "maps"))
+# Debug: save every Nth RAW incoming frame (exact pixels the model receives —
+# resolution + blur check). Off unless MAP_DEBUG_DUMP is set to a truthy value.
+DEBUG_DUMP = os.environ.get("MAP_DEBUG_DUMP", "").lower() not in ("", "0", "false", "no")
+DEBUG_EVERY = int(os.environ.get("MAP_DEBUG_EVERY", "10"))
+DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug_frames")
 
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _DTYPE = (
@@ -175,9 +180,22 @@ class MapSession:
             return []
         self.last_frame_at = time.time()
         self.frames_in += 1
+        if DEBUG_DUMP and self.frames_in % DEBUG_EVERY == 0:
+            self._dump_frame(rgb)
         t0 = time.perf_counter()
         frame = _preprocess_array(rgb)
         return self._ingest(frame, t0, time.perf_counter())
+
+    def _dump_frame(self, rgb: np.ndarray) -> None:
+        """Save the raw received frame as JPEG — what WebRTC actually delivered
+        (resolution in the filename), before any resize the model applies."""
+        try:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            h, w = rgb.shape[:2]
+            name = f"{self.session_id}_{self.frames_in:05d}_{w}x{h}.jpg"
+            Image.fromarray(rgb).save(os.path.join(DEBUG_DIR, name), quality=90)
+        except Exception as err:
+            print(f"[debug] frame dump failed: {err}")
 
     def _ingest(self, frame: torch.Tensor, t0: float, t_pre: float) -> list["Chunk"]:
         if self.state == "warming":

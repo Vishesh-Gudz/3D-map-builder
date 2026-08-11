@@ -34,3 +34,4 @@ output_pointcloud*.mp4
 *_frames/
 *_sky_masks/
 
+debug_frames/

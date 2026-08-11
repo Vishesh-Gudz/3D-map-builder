@@ -26,9 +26,11 @@ import threading
 import time
 from typing import Optional
 
+import glob
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import engine
 from rtc_client import RtcSubscriber
@@ -211,6 +213,12 @@ async def start(body: dict) -> dict:
     await _teardown_rtc()
     _session = engine.new_session(peer_id)
     _chunk_buffer = []
+    if engine.DEBUG_DUMP:  # fresh gallery per session
+        for f in glob.glob(os.path.join(engine.DEBUG_DIR, "*.jpg")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     # Join the WebRTC room and consume the phone's real stream. Falls back to
     # the HTTP /frame path (old JPEG lane) if signaling is unreachable.
@@ -265,6 +273,42 @@ async def chunks(session_id: str, since: int = 0) -> JSONResponse:
         raise HTTPException(404, "no such session")
     pending = [c for c in _chunk_buffer if c["seq"] > since]
     return JSONResponse({"chunks": pending, "state": s.state})
+
+
+@app.get("/debug/frames", response_class=HTMLResponse)
+async def debug_frames() -> HTMLResponse:
+    """Browser gallery of the raw frames the model received (MAP_DEBUG_DUMP=1).
+    The filename carries the real capture resolution (…_WxH.jpg)."""
+    files = sorted(os.path.basename(p) for p in glob.glob(
+        os.path.join(engine.DEBUG_DIR, "*.jpg")))
+    if not files:
+        return HTMLResponse(
+            "<p style='font-family:sans-serif'>No debug frames yet. Set "
+            "<code>MAP_DEBUG_DUMP=1</code> before start.sh, then run a map "
+            "session.</p>")
+    cells = "".join(
+        f'<figure style="margin:0"><img src="/debug/frames/{f}" '
+        f'style="width:100%;display:block"><figcaption '
+        f'style="font:12px monospace;color:#333;padding:4px">{f}</figcaption>'
+        f'</figure>' for f in files)
+    html = (
+        "<html><body style='background:#111;margin:0'>"
+        f"<p style='color:#ccc;font:13px sans-serif;padding:8px'>"
+        f"{len(files)} frames — filename shows real capture resolution</p>"
+        "<div style='display:grid;gap:8px;padding:8px;"
+        "grid-template-columns:repeat(auto-fill,minmax(280px,1fr))'>"
+        f"{cells}</div></body></html>")
+    return HTMLResponse(html)
+
+
+@app.get("/debug/frames/{name}")
+async def debug_frame(name: str) -> FileResponse:
+    if "/" in name or "\\" in name or not name.endswith(".jpg"):
+        raise HTTPException(404, "bad name")
+    path = os.path.join(engine.DEBUG_DIR, name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "no such frame")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.get("/maps/{session_id}.ply")
