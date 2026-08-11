@@ -261,6 +261,11 @@ class MapSession:
         c2w_np = c2w[0].cpu().numpy()
 
         # ── diagnostics: is depth degenerate, or is camera translation lost? ──
+        cap_dur = max(1e-6, self.last_frame_at - self.created_at)
+        print(f"[diag] captured {self.frames_in} frames over {cap_dur:.1f}s = "
+              f"{self.frames_in / cap_dur:.1f} fps effective "
+              f"(walking at 5fps puts ~30cm between frames — too far for the "
+              f"model to track)")
         cam_pos = c2w_np[:, :3, 3]                                  # [S,3]
         path_len = float(np.linalg.norm(np.diff(cam_pos, axis=0), axis=1).sum())
         span = float(np.linalg.norm(cam_pos.max(0) - cam_pos.min(0)))
