@@ -6,10 +6,9 @@ set -e
 cd "$(dirname "$0")"
 
 echo "== [1/4] python deps =="
-pip install -q -e . 2>&1 | tail -1 || true
-pip install -q fastapi 'uvicorn[standard]' httpx onnxruntime 2>&1 | tail -1 || true
-# WebRTC subscriber: pod joins the mesh and eats the phone's real stream.
-pip install -q aiortc av "python-socketio[asyncio_client]" 2>&1 | tail -1 || true
+export PIP_BREAK_SYSTEM_PACKAGES=1
+pip install -q -e .
+pip install -q fastapi 'uvicorn[standard]' httpx onnxruntime aiortc av "python-socketio[asyncio_client]"
 
 echo "== [2/4] model weights =="
 python fetch_model.py
