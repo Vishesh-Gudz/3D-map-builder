@@ -260,6 +260,20 @@ class MapSession:
         intri_np = intri[0].cpu().numpy()
         c2w_np = c2w[0].cpu().numpy()
 
+        # ── diagnostics: is depth degenerate, or is camera translation lost? ──
+        cam_pos = c2w_np[:, :3, 3]                                  # [S,3]
+        path_len = float(np.linalg.norm(np.diff(cam_pos, axis=0), axis=1).sum())
+        span = float(np.linalg.norm(cam_pos.max(0) - cam_pos.min(0)))
+        print(f"[diag] camera path length {path_len:.2f} | bbox span {span:.2f} | "
+              f"start {cam_pos[0].round(2)} end {cam_pos[-1].round(2)}")
+        for s in (0, S // 2, S - 1):
+            d = depth[0, s].float().numpy().squeeze(-1)
+            c = depth_conf[0, s].float().numpy()
+            print(f"[diag] frame {s}: depth min {d.min():.3f} max {d.max():.3f} "
+                  f"mean {d.mean():.3f} std {d.std():.3f} | "
+                  f"conf mean {c.mean():.2f} p10 {np.percentile(c, 10):.2f} "
+                  f"p90 {np.percentile(c, 90):.2f}")
+
         chunks: list[Chunk] = []
         for s in range(S):
             # Per-frame unprojection keeps peak memory at one frame.
@@ -273,6 +287,12 @@ class MapSession:
             chunk = self._points_to_chunk(wp, conf, rgb, c2w_np[s])
             if chunk is not None:
                 chunks.append(chunk)
+        if self.acc_xyz:
+            allp = np.concatenate(self.acc_xyz, axis=0)
+            lo, hi = allp.min(0), allp.max(0)
+            print(f"[diag] cloud bbox {(hi - lo).round(2)} "
+                  f"(camera path {path_len:.2f} — a real walk should be the "
+                  f"same order as the scene size)")
         print(f"[engine] extracted {self.total_points} points in {len(chunks)} chunks")
         return chunks
 
