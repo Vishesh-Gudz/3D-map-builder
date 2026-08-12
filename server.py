@@ -392,16 +392,34 @@ async def video_status(job_id: str) -> dict:
     }
 
 
+CHUNK_PAGE_BYTES = int(os.environ.get("MAP_CHUNK_PAGE_BYTES", str(6 * 1024 * 1024)))
+
+
 @app.get("/video/{job_id}/chunks")
 async def video_chunks(job_id: str, since: int = 0, limit: int = 40) -> JSONResponse:
-    """Paged chunk pull — the browser appends each page to the point cloud."""
+    """Paged chunk pull — the browser appends each page to the point cloud.
+
+    Paged by BYTES as well as count: fused point chunks are ~1-5 MB of base64
+    each, so honouring `limit` alone built responses in the hundreds of MB and
+    RunPod's proxy aborted them with ERR_HTTP2_PROTOCOL_ERROR (the map simply
+    never appeared). Always return at least one chunk so a single oversized one
+    can still make progress rather than deadlocking the client.
+    """
     job = _jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "no such job")
-    page = job["chunks"][since:since + limit]
+    all_chunks = job["chunks"]
+    page: list = []
+    budget = CHUNK_PAGE_BYTES
+    for c in all_chunks[since:since + max(1, limit)]:
+        size = len(c.get("points", "")) + len(c.get("colors", "")) + len(c.get("confs", ""))
+        if page and size > budget:
+            break
+        page.append(c)
+        budget -= size
     return JSONResponse({
         "state": job["state"],
-        "total": len(job["chunks"]),
+        "total": len(all_chunks),
         "next": since + len(page),
         "chunks": page,
     })

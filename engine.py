@@ -417,7 +417,10 @@ class MapSession:
                   f"({xyz.shape[0] / max(1, fused_xyz.shape[0]):.1f} views each)")
             del xyz, rgbs, confs, vox, keys, inv
 
-            PAGE = 200_000
+            # 200k points was ~5MB of base64 per chunk, and a 40-chunk page then
+            # exceeded what the RunPod proxy would carry. 50k keeps each chunk
+            # near 1.2MB so pages stay transferable.
+            PAGE = 50_000
             for i in range(0, fused_xyz.shape[0], PAGE):
                 px = fused_xyz[i:i + PAGE]
                 pc = fused_rgb[i:i + PAGE]
