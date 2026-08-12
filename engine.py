@@ -70,7 +70,11 @@ def auto_keyframe_interval(num_frames: int) -> int:
 CAMERA_ITERS = int(os.environ.get("MAP_CAMERA_ITERS", "4"))  # demo default; 1 = fast/inaccurate
 CONF_THRESHOLD = float(os.environ.get("MAP_CONF_THRESHOLD", "1.5"))
 PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nth pixel
-VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.03"))   # world-unit dedupe grid
+# Fusion grid. Measured on a 348-frame clip (93.4M observations): 0.03 gave
+# 168k points at 555 views each (heavily over-smoothed), 0.012 gave 1.6M at 57,
+# and 0.005 gives 9.6M at ~10 views — enough averaging to cancel noise without
+# erasing detail. Go smaller for more detail at the cost of noise and memory.
+VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.005"))
 MAX_FRAMES = int(os.environ.get("MAP_MAX_FRAMES", "2000"))
 MAPS_DIR = os.environ.get("MAPS_DIR", os.path.join(os.path.dirname(__file__), "maps"))
 # auto = crop for landscape, pad for portrait — the only correct default.
