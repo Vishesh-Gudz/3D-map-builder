@@ -60,6 +60,8 @@ PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nt
 VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.03"))   # world-unit dedupe grid
 MAX_FRAMES = int(os.environ.get("MAP_MAX_FRAMES", "2000"))
 MAPS_DIR = os.environ.get("MAPS_DIR", os.path.join(os.path.dirname(__file__), "maps"))
+# crop = demo default; pad preserves a portrait phone's full field of view.
+PREPROCESS_MODE = os.environ.get("MAP_PREPROCESS_MODE", "crop").lower()
 # Debug: save every Nth RAW incoming frame (exact pixels the model receives —
 # resolution + blur check). Off unless MAP_DEBUG_DUMP is set to a truthy value.
 DEBUG_DUMP = os.environ.get("MAP_DEBUG_DUMP", "").lower() not in ("", "0", "false", "no")
@@ -129,11 +131,37 @@ def _preprocess_jpeg(jpeg_bytes: bytes) -> torch.Tensor:
 
 
 def _preprocess_array(rgb: np.ndarray) -> torch.Tensor:
-    """Decoded RGB frame [H,W,3] → canonical-crop tensor. Mirrors
-    load_and_preprocess_images' crop mode exactly (resize width→IMG_SIZE,
-    height to /14 multiple, center-crop overflow) — no JPEG, no disk."""
+    """Decoded RGB frame [H,W,3] → model tensor, mirroring
+    load_and_preprocess_images without JPEG/disk.
+
+    MAP_PREPROCESS_MODE:
+      crop (demo default) — width→IMG_SIZE, centre-crop the overflow. Lossless
+        for LANDSCAPE input (nothing to crop), but a PORTRAIT phone stream loses
+        ~44% of its vertical field of view, including the near-floor region that
+        carries the strongest parallax for pose estimation.
+      pad — largest side→IMG_SIZE, letterbox the rest. Keeps the whole frame at
+        the cost of blank borders.
+    """
     img = Image.fromarray(rgb)
     w, h = img.size
+    if PREPROCESS_MODE == "pad":
+        if w >= h:
+            new_w = IMG_SIZE
+            new_h = round(h * (new_w / w) / 14) * 14
+        else:
+            new_h = IMG_SIZE
+            new_w = round(w * (new_h / h) / 14) * 14
+        img = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
+        t = to_tensor(img)
+        pad_h = IMG_SIZE - t.shape[1]
+        pad_w = IMG_SIZE - t.shape[2]
+        if pad_h > 0 or pad_w > 0:
+            top = pad_h // 2
+            left = pad_w // 2
+            t = torch.nn.functional.pad(
+                t, (left, pad_w - left, top, pad_h - top), value=1.0)
+        return t
+
     new_w = IMG_SIZE
     new_h = round(h * (new_w / w) / 14) * 14
     img = img.resize((new_w, new_h), Image.Resampling.BICUBIC)

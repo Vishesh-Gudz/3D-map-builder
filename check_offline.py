@@ -31,6 +31,8 @@ import engine
 
 def main() -> None:
     folder = sys.argv[1] if len(sys.argv) > 1 else "debug_frames"
+    # "crop" (demo default) vs "pad" (keeps a portrait stream's full FOV).
+    mode = sys.argv[2] if len(sys.argv) > 2 else "crop"
     paths = sorted(glob.glob(os.path.join(folder, "*.jpg")))
     if not paths:
         print(f"no frames in {folder} — run a session with "
@@ -41,8 +43,8 @@ def main() -> None:
 
     # demo.py's exact loader
     images = load_and_preprocess_images(
-        paths, mode="crop", image_size=engine.IMG_SIZE, patch_size=14)
-    print(f"[ab] preprocessed tensor {tuple(images.shape)}")
+        paths, mode=mode, image_size=engine.IMG_SIZE, patch_size=14)
+    print(f"[ab] mode={mode} preprocessed tensor {tuple(images.shape)}")
 
     model = engine.load_model()
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=engine._DTYPE):
