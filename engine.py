@@ -60,8 +60,11 @@ PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nt
 VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.03"))   # world-unit dedupe grid
 MAX_FRAMES = int(os.environ.get("MAP_MAX_FRAMES", "2000"))
 MAPS_DIR = os.environ.get("MAPS_DIR", os.path.join(os.path.dirname(__file__), "maps"))
-# crop = demo default; pad preserves a portrait phone's full field of view.
-PREPROCESS_MODE = os.environ.get("MAP_PREPROCESS_MODE", "crop").lower()
+# pad by default: measured on identical frames, it beats demo's `crop` for a
+# PORTRAIT phone stream — camera path 6.33 vs 4.75, extent 1.57 vs 0.96, and
+# 2.5-4.5x more per-frame depth relief (crop flattens frames toward planes
+# because it throws away 44% of the vertical FOV).
+PREPROCESS_MODE = os.environ.get("MAP_PREPROCESS_MODE", "pad").lower()
 # Debug: save every Nth RAW incoming frame (exact pixels the model receives —
 # resolution + blur check). Off unless MAP_DEBUG_DUMP is set to a truthy value.
 DEBUG_DUMP = os.environ.get("MAP_DEBUG_DUMP", "").lower() not in ("", "0", "false", "no")
