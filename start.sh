@@ -21,9 +21,10 @@ print("  cuda:", torch.cuda.is_available(),
 PY
 
 echo "== [4/4] starting service on :8090 =="
-# Cloud GPU (4090) fits full 518 + more scale frames + denser points.
+# Quality-relevant knobs live in engine.py so a plain `bash start.sh` reproduces
+# the measured-good config — do NOT re-default them here, or results silently
+# depend on which shell you started from.
 export MAP_SCALE_FRAMES="${MAP_SCALE_FRAMES:-8}"
-export MAP_PIXEL_STRIDE="${MAP_PIXEL_STRIDE:-2}"
 # SERVER_URL must point at your PUBLICLY reachable Express — it is BOTH the
 # chunk push target AND the socket.io signaling host the WebRTC subscriber
 # joins. ROOM_ID must match the phones' room (default shipment-glasses-dev).

@@ -68,8 +68,14 @@ def auto_keyframe_interval(num_frames: int) -> int:
         return (num_frames + ROPE_FRAME_LIMIT - 1) // ROPE_FRAME_LIMIT
     return 1
 CAMERA_ITERS = int(os.environ.get("MAP_CAMERA_ITERS", "4"))  # demo default; 1 = fast/inaccurate
-CONF_THRESHOLD = float(os.environ.get("MAP_CONF_THRESHOLD", "1.5"))
-PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nth pixel
+# 1.0 is the model's confidence floor, i.e. keep everything. Filtering here is
+# DESTRUCTIVE, and the viewer already ships per-point confidence with its own
+# threshold slider (default 1.5) — so keep the data and cull in the UI, which is
+# how demo/viser work too. Raise this only to save bandwidth.
+CONF_THRESHOLD = float(os.environ.get("MAP_CONF_THRESHOLD", "1.0"))
+# Every pixel. Fusion averages overlapping observations, so more samples now
+# improve accuracy rather than just adding noise; stride 2 quarters the input.
+PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "1"))
 # Fusion grid. Measured on a 348-frame clip (93.4M observations): 0.03 gave
 # 168k points at 555 views each (heavily over-smoothed), 0.012 gave 1.6M at 57,
 # and 0.005 gives 9.6M at ~10 views — enough averaging to cancel noise without
