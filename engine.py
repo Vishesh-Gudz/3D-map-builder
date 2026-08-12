@@ -374,8 +374,20 @@ class MapSession:
             confs = np.concatenate(obs_conf, axis=0)
             del obs_xyz, obs_rgb, obs_conf
             vox = np.floor(xyz / VOXEL_SIZE).astype(np.int64)
-            keys = (vox[:, 0] * 73856093) ^ (vox[:, 1] * 19349663) ^ (vox[:, 2] * 83492791)
-            _, inv = np.unique(keys, return_inverse=True)
+            # EXACT voxel key. The usual XOR-of-primes hash is not injective:
+            # distinct cells collide and get fused as if they were one surface,
+            # and shrinking VOXEL_SIZE makes the coordinates larger and the
+            # collisions MORE common — which is why 0.012 produced fewer points
+            # than 0.03. A linear index over the actual occupied grid cannot
+            # collide; fall back to a true row-wise unique if it would overflow.
+            vox -= vox.min(axis=0)
+            ext = vox.max(axis=0) + 1
+            if float(ext[0]) * float(ext[1]) * float(ext[2]) < 9e18:
+                keys = (vox[:, 0] * ext[1] + vox[:, 1]) * ext[2] + vox[:, 2]
+                _, inv = np.unique(keys, return_inverse=True)
+            else:
+                _, inv = np.unique(vox, axis=0, return_inverse=True)
+            inv = inv.reshape(-1)
             n_vox = inv.max() + 1 if inv.size else 0
             w = confs                                    # weight by confidence
             wsum = np.bincount(inv, weights=w, minlength=n_vox)
