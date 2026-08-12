@@ -21,6 +21,7 @@ Design notes:
 
 from __future__ import annotations
 
+import io
 import os
 import struct
 import tempfile
@@ -32,7 +33,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision.transforms.functional import to_tensor
 
 from lingbot_map.models.gct_stream import GCTStream
@@ -72,11 +73,22 @@ PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nt
 VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.03"))   # world-unit dedupe grid
 MAX_FRAMES = int(os.environ.get("MAP_MAX_FRAMES", "2000"))
 MAPS_DIR = os.environ.get("MAPS_DIR", os.path.join(os.path.dirname(__file__), "maps"))
-# pad by default: measured on identical frames, it beats demo's `crop` for a
-# PORTRAIT phone stream — camera path 6.33 vs 4.75, extent 1.57 vs 0.96, and
-# 2.5-4.5x more per-frame depth relief (crop flattens frames toward planes
-# because it throws away 44% of the vertical FOV).
-PREPROCESS_MODE = os.environ.get("MAP_PREPROCESS_MODE", "pad").lower()
+# auto = crop for landscape, pad for portrait — the only correct default.
+# crop resizes width to IMG_SIZE and centre-crops the overflow, so it discards
+# nothing for a LANDSCAPE frame (518x294 is close to the model's native
+# 518x378) but throws away ~44% of a PORTRAIT frame's vertical FOV, including
+# the near-floor region that carries the most parallax. Measured on identical
+# portrait frames: pad gave camera path 6.33 vs 4.75, extent 1.57 vs 0.96 and
+# 2.5-4.5x more per-frame depth relief. Padding a landscape frame instead just
+# wastes 44% of the tokens on blank borders, hence per-aspect selection.
+PREPROCESS_MODE = os.environ.get("MAP_PREPROCESS_MODE", "auto").lower()
+
+
+def resolve_mode(width: int, height: int) -> str:
+    """'auto' → crop for landscape, pad for portrait."""
+    if PREPROCESS_MODE in ("crop", "pad"):
+        return PREPROCESS_MODE
+    return "pad" if height > width else "crop"
 # Debug: save every Nth RAW incoming frame (exact pixels the model receives —
 # resolution + blur check). Off unless MAP_DEBUG_DUMP is set to a truthy value.
 DEBUG_DUMP = os.environ.get("MAP_DEBUG_DUMP", "").lower() not in ("", "0", "false", "no")
@@ -129,20 +141,11 @@ def load_model() -> GCTStream:
 
 
 def _preprocess_jpeg(jpeg_bytes: bytes) -> torch.Tensor:
-    """JPEG bytes → canonical-crop tensor [3, H, W] — the EXACT preprocessing
-    demo.py uses (via a temp file, so resize/crop stays identical)."""
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        f.write(jpeg_bytes)
-        path = f.name
-    try:
-        images = load_and_preprocess_images([path], mode="crop",
-                                            image_size=IMG_SIZE, patch_size=14)
-        return images[0]
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    """JPEG bytes → model tensor (HTTP debug path). Delegates to the array path
+    so every entry point shares one preprocessing rule."""
+    img = Image.open(io.BytesIO(jpeg_bytes))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    return _preprocess_array(np.asarray(img))
 
 
 def _preprocess_array(rgb: np.ndarray) -> torch.Tensor:
@@ -159,7 +162,7 @@ def _preprocess_array(rgb: np.ndarray) -> torch.Tensor:
     """
     img = Image.fromarray(rgb)
     w, h = img.size
-    if PREPROCESS_MODE == "pad":
+    if resolve_mode(w, h) == "pad":
         if w >= h:
             new_w = IMG_SIZE
             new_h = round(h * (new_w / w) / 14) * 14
@@ -327,7 +330,14 @@ class MapSession:
                   f"conf mean {c.mean():.2f} p10 {np.percentile(c, 10):.2f} "
                   f"p90 {np.percentile(c, 90):.2f}")
 
+        # ── pass 1: gather every observation + per-frame camera pose ──────────
+        # A pose-only chunk (count 0) carries the trajectory so the viewer's
+        # trail and frustums still build frame by frame.
         chunks: list[Chunk] = []
+        obs_xyz: list[np.ndarray] = []
+        obs_rgb: list[np.ndarray] = []
+        obs_conf: list[np.ndarray] = []
+        st = PIXEL_STRIDE
         for s in range(S):
             # Per-frame unprojection keeps peak memory at one frame.
             wp, _, _ = depth_to_world_coords_points(
@@ -337,9 +347,68 @@ class MapSession:
             conf = depth_conf[0, s].float().numpy()                    # [H,W]
             rgb = (images[0, s].float().numpy().transpose(1, 2, 0) * 255
                    ).clip(0, 255).astype(np.uint8)                     # [H,W,3]
-            chunk = self._points_to_chunk(wp, conf, rgb, c2w_np[s])
-            if chunk is not None:
-                chunks.append(chunk)
+
+            wp_s = wp[::st, ::st].reshape(-1, 3)
+            conf_s = conf[::st, ::st].reshape(-1)
+            rgb_s = rgb[::st, ::st].reshape(-1, 3)
+            keep = (conf_s >= CONF_THRESHOLD) & np.isfinite(wp_s).all(axis=1)
+            if keep.any():
+                obs_xyz.append(wp_s[keep].astype(np.float32))
+                obs_rgb.append(rgb_s[keep])
+                obs_conf.append(conf_s[keep].astype(np.float32))
+            self.frames_mapped += 1
+            self.seq += 1
+            chunks.append(Chunk(
+                seq=self.seq, count=0, points=b"", colors=b"", confs=b"",
+                pose=np.asarray(c2w_np[s], dtype=np.float32).reshape(-1).tolist(),
+            ))
+
+        # ── pass 2: fuse observations per voxel (confidence-weighted) ─────────
+        # Previously the FIRST point to land in a voxel won and every later
+        # sighting of that surface was discarded — so each surface kept its
+        # earliest, most distant, noisiest observation. Averaging all views of a
+        # voxel instead cuts positional noise roughly with sqrt(view count).
+        if obs_xyz:
+            xyz = np.concatenate(obs_xyz, axis=0)
+            rgbs = np.concatenate(obs_rgb, axis=0).astype(np.float32)
+            confs = np.concatenate(obs_conf, axis=0)
+            del obs_xyz, obs_rgb, obs_conf
+            vox = np.floor(xyz / VOXEL_SIZE).astype(np.int64)
+            keys = (vox[:, 0] * 73856093) ^ (vox[:, 1] * 19349663) ^ (vox[:, 2] * 83492791)
+            _, inv = np.unique(keys, return_inverse=True)
+            n_vox = inv.max() + 1 if inv.size else 0
+            w = confs                                    # weight by confidence
+            wsum = np.bincount(inv, weights=w, minlength=n_vox)
+            wsum_safe = np.where(wsum > 0, wsum, 1.0)
+            fused_xyz = np.stack([
+                np.bincount(inv, weights=xyz[:, d] * w, minlength=n_vox) / wsum_safe
+                for d in range(3)
+            ], axis=1).astype(np.float32)
+            fused_rgb = np.stack([
+                np.bincount(inv, weights=rgbs[:, d] * w, minlength=n_vox) / wsum_safe
+                for d in range(3)
+            ], axis=1).clip(0, 255).astype(np.uint8)
+            counts = np.bincount(inv, minlength=n_vox)
+            fused_conf = (wsum / np.maximum(counts, 1)).astype(np.float32)
+            print(f"[engine] fused {xyz.shape[0]} observations into "
+                  f"{fused_xyz.shape[0]} voxels "
+                  f"({xyz.shape[0] / max(1, fused_xyz.shape[0]):.1f} views each)")
+            del xyz, rgbs, confs, vox, keys, inv
+
+            PAGE = 200_000
+            for i in range(0, fused_xyz.shape[0], PAGE):
+                px = fused_xyz[i:i + PAGE]
+                pc = fused_rgb[i:i + PAGE]
+                pf = fused_conf[i:i + PAGE]
+                self.acc_xyz.append(px)
+                self.acc_rgb.append(pc)
+                self.total_points += int(px.shape[0])
+                self.seq += 1
+                chunks.append(Chunk(
+                    seq=self.seq, count=int(px.shape[0]),
+                    points=px.tobytes(), colors=pc.tobytes(),
+                    confs=pf.tobytes(), pose=[],
+                ))
         if self.acc_xyz:
             allp = np.concatenate(self.acc_xyz, axis=0)
             lo, hi = allp.min(0), allp.max(0)
@@ -454,12 +523,15 @@ def load_video_frames(video_path: str, fps: int = 10) -> torch.Tensor:
     out_dir = tempfile.mkdtemp(prefix="lingbot_video_")
     paths: list[str] = []
     idx = 0
+    src_w = src_h = 0
     try:
         while len(paths) < MAX_FRAMES:
             ok, frame = cap.read()
             if not ok:
                 break
             if idx % interval == 0:
+                if not paths:
+                    src_h, src_w = frame.shape[:2]
                 p = os.path.join(out_dir, f"{len(paths):06d}.jpg")
                 cv2.imwrite(p, frame)
                 paths.append(p)
@@ -468,10 +540,13 @@ def load_video_frames(video_path: str, fps: int = 10) -> torch.Tensor:
         cap.release()
     if not paths:
         raise ValueError("no frames decoded from video")
+    # Match the live path: crop a landscape recording (lossless), pad a portrait
+    # one (crop would discard ~44% of its vertical FOV).
+    mode = resolve_mode(src_w, src_h)
     print(f"[engine] decoded {len(paths)} frames from video "
-          f"(src {src_fps:.1f}fps, every {interval})")
+          f"(src {src_fps:.1f}fps, every {interval}, {src_w}x{src_h}, mode={mode})")
     images = load_and_preprocess_images(
-        paths, mode="crop", image_size=IMG_SIZE, patch_size=14)
+        paths, mode=mode, image_size=IMG_SIZE, patch_size=14)
     for p in paths:
         try:
             os.unlink(p)
