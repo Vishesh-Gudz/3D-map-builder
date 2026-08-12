@@ -392,7 +392,9 @@ async def video_status(job_id: str) -> dict:
     }
 
 
-CHUNK_PAGE_BYTES = int(os.environ.get("MAP_CHUNK_PAGE_BYTES", str(6 * 1024 * 1024)))
+# 2MB pages. 6MB still drew ERR_HTTP2_PROTOCOL_ERROR through the RunPod proxy;
+# smaller responses transfer reliably and a dropped one costs little to retry.
+CHUNK_PAGE_BYTES = int(os.environ.get("MAP_CHUNK_PAGE_BYTES", str(2 * 1024 * 1024)))
 
 
 @app.get("/video/{job_id}/chunks")
