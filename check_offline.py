@@ -51,7 +51,7 @@ def main() -> None:
         preds = model.inference_streaming(
             images,
             num_scale_frames=engine.NUM_SCALE_FRAMES,
-            keyframe_interval=engine.KEYFRAME_INTERVAL,
+            keyframe_interval=engine.auto_keyframe_interval(images.shape[0]),
             output_device=torch.device("cpu"),
         )
 

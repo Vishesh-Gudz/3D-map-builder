@@ -50,10 +50,22 @@ MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(os.path.dirname(__file__)
 # comes from bf16 + kv sliding window + camera_iters=1 instead.
 IMG_SIZE = int(os.environ.get("MAP_IMG_SIZE", "518"))
 NUM_SCALE_FRAMES = int(os.environ.get("MAP_SCALE_FRAMES", "8"))
-# 1 = every frame anchored in the KV cache (demo.py's value for <320-frame
-# runs). Higher trades pose accuracy for cache memory — do NOT raise for
-# quality-sensitive maps.
-KEYFRAME_INTERVAL = int(os.environ.get("MAP_KEYFRAME_INTERVAL", "1"))
+# The model's RoPE is trained to ~320 frames. Past that the KV cache runs
+# outside the trained positional range and pose COLLAPSES (drifting depth,
+# confidence pinned at its floor). demo.py guards against this by auto-picking
+# ceil(N/320) so the cache stays inside the limit while every frame is still
+# inferred. 0 = auto (default); set a positive value to force one.
+KEYFRAME_INTERVAL_ENV = int(os.environ.get("MAP_KEYFRAME_INTERVAL", "0"))
+ROPE_FRAME_LIMIT = 320
+
+
+def auto_keyframe_interval(num_frames: int) -> int:
+    """demo.py's rule: 1 up to the RoPE limit, else ceil(N / 320)."""
+    if KEYFRAME_INTERVAL_ENV > 0:
+        return KEYFRAME_INTERVAL_ENV
+    if num_frames > ROPE_FRAME_LIMIT:
+        return (num_frames + ROPE_FRAME_LIMIT - 1) // ROPE_FRAME_LIMIT
+    return 1
 CAMERA_ITERS = int(os.environ.get("MAP_CAMERA_ITERS", "4"))  # demo default; 1 = fast/inaccurate
 CONF_THRESHOLD = float(os.environ.get("MAP_CONF_THRESHOLD", "1.5"))
 PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "4"))    # sample every Nth pixel
@@ -263,15 +275,17 @@ class MapSession:
         self.state = "processing"
         model = load_model()
         S = images.shape[1]
+        keyframe_interval = auto_keyframe_interval(S)
         t0 = time.time()
         print(f"[engine] reconstructing {S} frames (inference_streaming, "
-              f"scale={NUM_SCALE_FRAMES}, keyframe={KEYFRAME_INTERVAL}, "
+              f"scale={NUM_SCALE_FRAMES}, keyframe={keyframe_interval}"
+              f"{' [auto: >320-frame RoPE limit]' if keyframe_interval > 1 else ''}, "
               f"cam_iters={CAMERA_ITERS})…")
         with _infer_lock, torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
             preds = model.inference_streaming(
                 images,
                 num_scale_frames=NUM_SCALE_FRAMES,
-                keyframe_interval=KEYFRAME_INTERVAL,
+                keyframe_interval=keyframe_interval,
                 output_device=torch.device("cpu"),
             )
         pose_enc = preds["pose_enc"]        # [1,S,9]
