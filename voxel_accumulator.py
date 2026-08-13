@@ -75,21 +75,24 @@ class VoxelAccumulator:
         xyz: np.ndarray,
         rgb: np.ndarray,
         conf: np.ndarray,
-    ) -> np.ndarray:
-        """Fold one frame in. Returns the keys of voxels this frame CREATED.
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Fold one frame in. Returns (xyz, rgb, conf) of the voxels it CREATED.
 
-        Only new keys are returned because the viewer appends rather than
-        indexes — re-sending a refined voxel would draw it twice. The refined
-        values are still correct in ``finalize()``, which is what the finished
-        map is built from.
+        Only created voxels come back because the viewer appends rather than
+        indexes — re-sending a refined voxel would draw it twice. Their values
+        are this frame's own weighted mean, which is the best estimate that
+        exists at the moment of creation; later views refine it and ``finalize``
+        reflects that, which is what the finished map is built from.
         """
+        empty = (np.empty((0, 3), np.float32), np.empty((0, 3), np.uint8),
+                 np.empty(0, np.float32))
         if xyz.shape[0] == 0:
-            return np.empty(0, dtype=np.int64)
+            return empty
         vox = np.floor(np.asarray(xyz, dtype=np.float64) / self.voxel_size).astype(np.int64)
         keys, ok = _encode(vox)
         self.dropped += int((~ok).sum())
         if keys.size == 0:
-            return np.empty(0, dtype=np.int64)
+            return empty
         w = np.asarray(conf, dtype=np.float64)[ok]
         p = np.asarray(xyz, dtype=np.float64)[ok]
         c = np.asarray(rgb, dtype=np.float64)[ok]
@@ -109,14 +112,17 @@ class VoxelAccumulator:
             uk, fw, fxyz, frgb, fcnt = rest
             rest = self._pending.accumulate(uk, fw, fxyz, frgb, fcnt)
         if rest is None:
-            return np.empty(0, dtype=np.int64)
+            return empty
 
         uk, fw, fxyz, frgb, fcnt = rest
         self._pending.insert(uk, fw, fxyz, frgb, fcnt)
         if self._pending.size > max(self._merge_floor, int(self._merge_ratio * self._main.size)):
             self._main.absorb(self._pending)
             self._pending = _Store()
-        return uk
+        safe = np.where(fw > 0, fw, 1.0)[:, None]
+        return ((fxyz / safe).astype(np.float32),
+                (frgb / safe).clip(0, 255).astype(np.uint8),
+                (fw / np.maximum(fcnt, 1)).astype(np.float32))
 
     # ── readout ──────────────────────────────────────────────────────────────
     @property

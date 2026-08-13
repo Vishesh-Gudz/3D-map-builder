@@ -248,6 +248,27 @@ def warm_model(model, images: torch.Tensor, keyframe_interval: int,
               f"(compile={COMPILE}, backend={'sdpa' if USE_SDPA else 'flashinfer'})")
 
 
+def poses_from_pose_enc(pose_enc: torch.Tensor, hw: tuple):
+    """pose_enc [1,S,9] → (w2c [S,3,4], intrinsics [S,3,3], c2w [S,4,4]) as numpy.
+
+    EXACT demo.py → viser composition, and the single source of truth for it:
+    pose_encoding_to_extri_intri returns the camera-TO-world matrix, demo's
+    postprocess inverts it, and the geometry helper inverts it back before
+    applying. Do NOT shortcut this with model._unproject_depth_to_world — that
+    applies the INVERSE transform, and the symptom is subtle rather than loud:
+    points scatter, voxel dedupe stops hitting, and the camera trail collapses.
+
+    Shared by the batch and streaming paths deliberately. This is the code that
+    was wrong for days; it must not exist in two places that can drift.
+    """
+    extri, intri = pose_encoding_to_extri_intri(pose_enc.float(), hw)  # [1,S,3,4]/[1,S,3,3]
+    c2w = torch.zeros((*extri.shape[:-2], 4, 4), dtype=extri.dtype)
+    c2w[..., :3, :4] = extri
+    c2w[..., 3, 3] = 1.0
+    w2c = closed_form_inverse_se3_general(c2w)[..., :3, :4]  # what demo stores as "extrinsic"
+    return (w2c[0].cpu().numpy(), intri[0].cpu().numpy(), c2w[0].cpu().numpy())
+
+
 def release_gpu_memory() -> None:
     """Hand cached-but-unused blocks back to the driver, and report the split.
 
@@ -448,14 +469,7 @@ class MapSession:
         # with model._unproject_depth_to_world — that applies the INVERSE
         # transform (points scatter, dedupe never hits, trail collapses).
         hw = tuple(images.shape[-2:])
-        extri, intri = pose_encoding_to_extri_intri(pose_enc.float(), hw)  # [1,S,3,4]/[1,S,3,3]
-        c2w = torch.zeros((*extri.shape[:-2], 4, 4), dtype=extri.dtype)
-        c2w[..., :3, :4] = extri
-        c2w[..., 3, 3] = 1.0
-        w2c = closed_form_inverse_se3_general(c2w)[..., :3, :4]  # what demo stores as "extrinsic"
-        w2c_np = w2c[0].cpu().numpy()
-        intri_np = intri[0].cpu().numpy()
-        c2w_np = c2w[0].cpu().numpy()
+        w2c_np, intri_np, c2w_np = poses_from_pose_enc(pose_enc, hw)
 
         # ── diagnostics: is depth degenerate, or is camera translation lost? ──
         cap_dur = max(1e-6, self.last_frame_at - self.created_at)

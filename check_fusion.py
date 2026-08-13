@@ -111,7 +111,7 @@ def main() -> int:
         gr = np.concatenate([f[1] for f in batch])
         gc = np.concatenate([f[2] for f in batch])
         t1 = time.perf_counter()
-        created += acc.add(gx, gr, gc).size
+        created += acc.add(gx, gr, gc)[0].shape[0]
         per_call_ms.append((time.perf_counter() - t1) * 1e3)
     ix, ic, if_ = acc.finalize()
     t_inc = time.perf_counter() - t0
