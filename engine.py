@@ -78,9 +78,12 @@ try:  # noqa: SIM105 - probe only, never fatal
 except Exception:
     pass
 USE_SDPA = os.environ.get("MAP_USE_SDPA", "").lower() in ("1", "true", "yes") or not _FLASHINFER_OK
-# torch.compile the hot blocks. Costs a warmup pass on the first job, then runs
-# fused kernels; the reference claims ~5fps at 518x378.
-COMPILE = os.environ.get("MAP_COMPILE", "").lower() in ("1", "true", "yes")
+# torch.compile the hot blocks. ON by default: measured +13% on landscape
+# (15.69 -> 17.72 fps) with identical output. Inductor compiles lazily per input
+# SHAPE and caches on the wrapper, so the cost is one-time per shape per process
+# — 15.1s on the first job, then 1.7s. We pay it at boot instead (see
+# warm_boot_shapes), so job 1 is already fast. Set MAP_COMPILE=0 to disable.
+COMPILE = os.environ.get("MAP_COMPILE", "1").lower() not in ("0", "false", "no", "")
 # NOT reduce-overhead. That mode wraps each graph in CUDA graphs, and lingbot's
 # RoPE memoises cos/sin components (rope.py _compute_frequency_components) — the
 # cached tensor is allocated in the graph's private pool, so the next replay
@@ -171,9 +174,42 @@ def load_model() -> GCTStream:
     _model = model
     print(f"[engine] model loaded in {time.time() - t0:.1f}s "
           f"(device={_DEVICE}, dtype={_DTYPE}, img_size={IMG_SIZE}, "
-          f"backend={'sdpa' if USE_SDPA else 'flashinfer'}, compile={COMPILE}, "
+          f"backend={'sdpa' if USE_SDPA else 'flashinfer'}, "
+          f"compile={COMPILE_MODE if COMPILE else False}, "
           f"cam_iters={CAMERA_ITERS})")
+    warm_boot_shapes(model)
     return model
+
+
+# Shapes preprocessing actually produces: portrait pads to a square, 16:9
+# landscape crops to 518x294. Inductor keys its graphs on shape, so warming both
+# here means neither aspect pays compile cost on its first real job. An unlisted
+# aspect (4:3, say) still works — it just compiles on first use like before.
+BOOT_WARM_SHAPES = [(IMG_SIZE, IMG_SIZE), (294, IMG_SIZE)]
+
+
+def warm_boot_shapes(model) -> None:
+    """Pay torch.compile's per-shape cost at boot rather than on job 1.
+
+    Measured: first job with compile spent 15.1s in warmup, the second 1.7s —
+    the graphs are cached per (module, shape) for the process lifetime. The pod
+    stays up for hours, so moving that cost to startup makes it free.
+
+    Never fatal. A compile failure here would otherwise take the whole service
+    down at boot, and eager mode is a perfectly good fallback.
+    """
+    if not COMPILE or not torch.cuda.is_available():
+        return
+    t0 = time.time()
+    for h, w in BOOT_WARM_SHAPES:
+        try:
+            # 20 frames is enough for the scale block (8) plus a streaming run.
+            dummy = torch.zeros((1, 20, 3, h, w), dtype=torch.float32)
+            warm_model(model, dummy, keyframe_interval=1, quiet=True)
+        except Exception as exc:  # noqa: BLE001 - warmup is best-effort
+            print(f"[engine] boot warmup skipped for {w}x{h}: {exc}")
+    print(f"[engine] boot warmup done in {time.time() - t0:.1f}s "
+          f"for shapes {['x'.join(map(str, (w, h))) for h, w in BOOT_WARM_SHAPES]}")
 
 
 def _compile_model(model) -> None:
@@ -192,7 +228,8 @@ def _compile_model(model) -> None:
     print(f"[engine] compiled hot modules (mode={COMPILE_MODE})")
 
 
-def warm_model(model, images: torch.Tensor, keyframe_interval: int) -> None:
+def warm_model(model, images: torch.Tensor, keyframe_interval: int,
+               quiet: bool = False) -> None:
     """Run the model once at the SHAPE inference will use, before timing starts.
 
     Needed even without torch.compile: FlashInfer JIT-builds its attention
@@ -230,8 +267,9 @@ def warm_model(model, images: torch.Tensor, keyframe_interval: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     model.clean_kv_cache()
-    print(f"[engine] warmup done in {time.time() - t0:.1f}s "
-          f"(compile={COMPILE}, backend={'sdpa' if USE_SDPA else 'flashinfer'})")
+    if not quiet:
+        print(f"[engine] warmup done in {time.time() - t0:.1f}s "
+              f"(compile={COMPILE}, backend={'sdpa' if USE_SDPA else 'flashinfer'})")
 
 
 def _preprocess_jpeg(jpeg_bytes: bytes) -> torch.Tensor:
