@@ -32,6 +32,19 @@ def main() -> int:
         return 2
     path = sys.argv[1]
 
+    # The KV pool alone is ~6.5GiB at landscape and ~11.8GiB at portrait, so a
+    # server left running by nohup (Ctrl-C only kills the tail, not the service)
+    # leaves nowhere near enough for a second model. Fail here with something
+    # readable rather than deep inside a layer norm.
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        if free < 14 * (1 << 30):
+            print(f"only {free / 2**30:.1f} GiB of {total / 2**30:.1f} GiB free — "
+                  f"something else is holding the GPU.\n"
+                  f"  pkill -9 -f uvicorn; sleep 3; "
+                  f"nvidia-smi --query-compute-apps=pid,used_memory --format=csv")
+            return 2
+
     images = engine.load_video_frames(path)               # [1,S,3,H,W]
     S = images.shape[1]
     kf = engine.auto_keyframe_interval(S)
