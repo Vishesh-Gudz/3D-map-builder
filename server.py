@@ -146,14 +146,23 @@ async def _capture_loop(s: engine.MapSession) -> None:
             continue
         arr, last_ts = slot
         last_buf = now
-        await asyncio.to_thread(s.add_frame_array, arr)
+        # Returns chunks only when MAP_LIVE_STREAMING is on; the batch path
+        # buffers and returns nothing until stop.
+        chunks = await asyncio.to_thread(s.add_frame_array, arr)
+        for c in chunks:
+            payload = _chunk_payload(s, c)
+            _chunk_buffer.append(payload)
+            if len(_chunk_buffer) > CHUNK_BUFFER_MAX:
+                _chunk_buffer.pop(0)
+            await _push_chunk(payload)
         if now - last_status >= 1.0:
             last_status = now
             try:
                 _push_queue.put_nowait({
                     "sessionId": s.session_id, "peerId": s.peer_id,
-                    "status": {"state": "warming", "frames": s.frames_in,
-                               "points": 0},
+                    "status": {"state": "mapping" if chunks else "warming",
+                               "frames": s.frames_in,
+                               "points": s.total_points},
                 })
             except asyncio.QueueFull:
                 pass

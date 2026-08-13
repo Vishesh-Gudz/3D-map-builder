@@ -107,6 +107,16 @@ PIXEL_STRIDE = int(os.environ.get("MAP_PIXEL_STRIDE", "1"))
 # erasing detail. Go smaller for more detail at the cost of noise and memory.
 VOXEL_SIZE = float(os.environ.get("MAP_VOXEL_SIZE", "0.005"))
 MAX_FRAMES = int(os.environ.get("MAP_MAX_FRAMES", "2000"))
+# Reconstruct each live frame as it arrives instead of batching on stop.
+# Off by default until it has run against a real phone session — the batch path
+# is what produced every good map so far, and this changes the live path only.
+LIVE_STREAMING = os.environ.get("MAP_LIVE_STREAMING", "").lower() in ("1", "true", "yes")
+# The live preview is deliberately coarser than the final map. Full resolution
+# fusion measured ~156ms/frame against a ~59ms budget at 17fps; stride 2 on a
+# 2cm grid measured 9.5ms/frame on real depth. The full-quality cloud is still
+# produced at stop from the retained frames, so nothing is lost — only deferred.
+LIVE_PREVIEW_STRIDE = int(os.environ.get("MAP_PREVIEW_STRIDE", "2"))
+LIVE_PREVIEW_VOXEL = float(os.environ.get("MAP_PREVIEW_VOXEL", "0.02"))
 MAPS_DIR = os.environ.get("MAPS_DIR", os.path.join(os.path.dirname(__file__), "maps"))
 # auto = crop for landscape, pad for portrait — the only correct default.
 # crop resizes width to IMG_SIZE and centre-crops the overflow, so it discards
@@ -369,6 +379,46 @@ class MapSession:
     acc_rgb: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_frame_at: float = field(default_factory=time.time)
+    # Live streaming state (MAP_LIVE_STREAMING). None means the batch path.
+    stream: object = None
+
+    # ── live streaming ────────────────────────────────────────────────────
+    def _stream_frame(self, tensor: torch.Tensor) -> list["Chunk"]:
+        """Push one preprocessed frame through the streaming reconstructor.
+
+        Validated bit-identical to the batch path by check_streaming.py — same
+        pose, depth and confidence to zero delta — so this changes WHEN geometry
+        appears, not what it is. Measured 0.3s to first points versus 6.6s.
+        """
+        from streaming import StreamingReconstructor
+
+        if self.stream is None:
+            model = load_model()
+            self.stream = StreamingReconstructor(
+                model, _DEVICE, _DTYPE,
+                scale_frames=NUM_SCALE_FRAMES,
+                # Live session length is unknown up front, so ceil(N/320) cannot
+                # be computed. Keyframe 1 is correct until the RoPE limit; past
+                # it, quality degrades and windowing is the real answer (2.4).
+                keyframe_interval=max(1, KEYFRAME_INTERVAL_ENV),
+                conf_threshold=CONF_THRESHOLD,
+                preview_stride=LIVE_PREVIEW_STRIDE,
+                preview_voxel=LIVE_PREVIEW_VOXEL,
+            )
+        chunks: list[Chunk] = []
+        for r in self.stream.push(tensor):
+            self.frames_mapped += 1
+            self.seq += 1
+            self.total_points += int(r.xyz.shape[0])
+            self.acc_xyz.append(r.xyz)
+            self.acc_rgb.append(r.rgb)
+            chunks.append(Chunk(
+                seq=self.seq, count=int(r.xyz.shape[0]),
+                points=r.xyz.tobytes(), colors=r.rgb.tobytes(),
+                confs=r.conf.tobytes(),
+                pose=np.asarray(r.pose_c2w, dtype=np.float32).reshape(-1).tolist(),
+            ))
+        return chunks
 
     # ── frame ingestion (buffer only — no inference during capture) ───────
     def add_frame(self, jpeg_bytes: bytes) -> list["Chunk"]:
@@ -381,15 +431,26 @@ class MapSession:
         return []
 
     def add_frame_array(self, rgb: np.ndarray) -> list["Chunk"]:
-        """Feed one decoded RGB frame (WebRTC path). Buffers; no chunks yet —
-        the whole clip is reconstructed together on stop (demo.py parity)."""
+        """Feed one decoded RGB frame (WebRTC path).
+
+        With MAP_LIVE_STREAMING the frame is reconstructed immediately and its
+        new geometry returned. Otherwise it is buffered and the whole clip is
+        reconstructed on stop (demo.py parity) — kept as a fallback because it
+        is the path that has produced every good map so far.
+        """
         if self.state != "capturing" or self.frames_in >= MAX_FRAMES:
             return []
         self.last_frame_at = time.time()
         self.frames_in += 1
         if DEBUG_DUMP and self.frames_in % DEBUG_EVERY == 0:
             self._dump_frame(rgb)
-        self.frames_buf.append(_preprocess_array(rgb))
+        tensor = _preprocess_array(rgb)
+        if LIVE_STREAMING:
+            # Not buffered here: the reconstructor retains frames itself for the
+            # full-quality pass at stop, and holding two copies of a 35s walk is
+            # ~1.2GB for no reason.
+            return self._stream_frame(tensor)
+        self.frames_buf.append(tensor)
         return []
 
     def _dump_frame(self, rgb: np.ndarray) -> None:
@@ -411,6 +472,28 @@ class MapSession:
 
         `images` [1,S,3,H,W] comes from a decoded video (upload path); when
         omitted the buffered WebRTC frames are used instead."""
+        if images is None and self.stream is not None:
+            # Live streaming already ran inference frame by frame. Re-use the
+            # retained per-frame output instead of inferring the clip a second
+            # time — the point of the two-tier design is that the coarse preview
+            # was a view of this same data, not a separate reconstruction.
+            if self.stream.index == 0:
+                return []
+            self.state = "processing"
+            images, d_np, c_np, pose_enc = self.stream.retained()
+            depth = torch.from_numpy(d_np).unsqueeze(0).unsqueeze(-1)  # [1,S,H,W,1]
+            depth_conf = torch.from_numpy(c_np).unsqueeze(0)           # [1,S,H,W]
+            S = images.shape[1]
+            print(f"[engine] finalizing {S} streamed frames at full resolution "
+                  f"(stride {PIXEL_STRIDE}, voxel {VOXEL_SIZE}) — live preview was "
+                  f"{self.stream.preview_points:,} voxels at {LIVE_PREVIEW_VOXEL}")
+            # The preview accumulator and its emitted chunks are superseded by
+            # the full-quality cloud below; reset so totals are not double
+            # counted and the viewer's reset lands on a clean set.
+            self.acc_xyz, self.acc_rgb, self.total_points = [], [], 0
+            self.stream = None
+            release_gpu_memory()
+            return self._extract(images, pose_enc, depth, depth_conf, S)
         if images is None:
             if not self.frames_buf:
                 return []
@@ -458,10 +541,18 @@ class MapSession:
               f"compile={COMPILE_MODE if COMPILE else False} "
               f"cam_iters={CAMERA_ITERS} keyframe={keyframe_interval} "
               f"stride={PIXEL_STRIDE}")
-        pose_enc = preds["pose_enc"]        # [1,S,9]
-        depth = preds["depth"]              # [1,S,H,W,1]
-        depth_conf = preds["depth_conf"]    # [1,S,H,W]
         print(f"[engine] inference done in {time.time() - t0:.1f}s — extracting")
+        return self._extract(images, preds["pose_enc"], preds["depth"],
+                             preds["depth_conf"], S)
+
+    def _extract(self, images, pose_enc, depth, depth_conf, S: int) -> list["Chunk"]:
+        """Unproject, fuse and chunk — everything after inference.
+
+        Shared by the batch path and the live streaming path's final pass so the
+        two cannot produce different clouds from the same predictions. Streaming
+        was verified bit-identical upstream of here (check_streaming.py), and
+        this keeps it identical downstream too.
+        """
 
         # EXACT demo.py → viser composition. pose_encoding_to_extri_intri returns
         # the camera-TO-world matrix; demo's postprocess inverts it and the
