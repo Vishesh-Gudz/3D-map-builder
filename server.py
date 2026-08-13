@@ -194,12 +194,11 @@ async def _reconstruct_loop(s: engine.MapSession, frames: asyncio.Queue) -> None
         arr = await frames.get()
         try:
             chunks = await asyncio.to_thread(s.add_frame_array, arr)
-            for c in chunks:
-                payload = _chunk_payload(s, c)
-                _chunk_buffer.append(payload)
-                if len(_chunk_buffer) > CHUNK_BUFFER_MAX:
-                    _chunk_buffer.pop(0)
-                await _push_chunk(payload)
+            # Queue, never await the POST. Pushes to Express were measured at
+            # 0.5-1.7s; awaiting one per frame made the NETWORK the bottleneck
+            # rather than the GPU, and the queue backed up until frames were
+            # dropped. _push_worker drains in order in the background.
+            _enqueue_chunks(s, chunks)
         except Exception as err:  # noqa: BLE001 - one bad frame must not end the session
             print(f"[capture] frame reconstruction failed: {err}")
         finally:
