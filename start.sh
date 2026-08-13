@@ -29,4 +29,12 @@ export MAP_SCALE_FRAMES="${MAP_SCALE_FRAMES:-8}"
 # chunk push target AND the socket.io signaling host the WebRTC subscriber
 # joins. ROOM_ID must match the phones' room (default shipment-glasses-dev).
 export ROOM_ID="${ROOM_ID:-shipment-glasses-dev}"
+# Virtual-memory-backed segments the allocator can grow and SHRINK. Without
+# this, a long sequence's peak fragments the pool and the process holds that
+# high-water mark for its lifetime — an idle pod was sitting at 23.8/24.5 GiB.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Reap any earlier server still pinning the GPU. A wedged CUDA process survives
+# pkill's default signal and each one holds its own multi-GiB model copy.
+pkill -9 -f "uvicorn server:app" 2>/dev/null || true
+sleep 1
 exec python -m uvicorn server:app --host 0.0.0.0 --port 8090

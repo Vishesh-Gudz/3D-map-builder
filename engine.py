@@ -272,6 +272,29 @@ def warm_model(model, images: torch.Tensor, keyframe_interval: int,
               f"(compile={COMPILE}, backend={'sdpa' if USE_SDPA else 'flashinfer'})")
 
 
+def release_gpu_memory() -> None:
+    """Hand cached-but-unused blocks back to the driver, and report the split.
+
+    PyTorch's caching allocator keeps freed blocks reserved so the next job
+    reuses them without re-allocating. That is normally the right trade, but
+    nvidia-smi counts reserved memory as used, so an idle pod reads ~97% VRAM
+    and there is no way to tell a healthy cache from a real leak by looking.
+
+    `allocated` is memory actually held by live tensors — that is the number
+    that must NOT grow across jobs. `reserved` is the allocator's pool and is
+    expected to sit high. Printing both makes a genuine leak obvious during a
+    long live session instead of at the OOM.
+    """
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    gib = 1 << 30
+    print(f"[mem] allocated {torch.cuda.memory_allocated() / gib:.2f} GiB | "
+          f"reserved {torch.cuda.memory_reserved() / gib:.2f} GiB | "
+          f"peak allocated {torch.cuda.max_memory_allocated() / gib:.2f} GiB")
+    torch.cuda.reset_peak_memory_stats()
+
+
 def _preprocess_jpeg(jpeg_bytes: bytes) -> torch.Tensor:
     """JPEG bytes → model tensor (HTTP debug path). Delegates to the array path
     so every entry point shares one preprocessing rule."""
@@ -578,6 +601,7 @@ class MapSession:
                   f"(camera path {path_len:.2f} — a real walk should be the "
                   f"same order as the scene size)")
         print(f"[engine] extracted {self.total_points} points in {len(chunks)} chunks")
+        release_gpu_memory()
         return chunks
 
     def _points_to_chunk(
