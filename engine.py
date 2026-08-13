@@ -78,9 +78,18 @@ try:  # noqa: SIM105 - probe only, never fatal
 except Exception:
     pass
 USE_SDPA = os.environ.get("MAP_USE_SDPA", "").lower() in ("1", "true", "yes") or not _FLASHINFER_OK
-# torch.compile the hot blocks (reduce-overhead + CUDA graphs). Costs 30-60s of
-# warmup at boot, then replays; the reference claims ~5fps at 518x378.
+# torch.compile the hot blocks. Costs a warmup pass on the first job, then runs
+# fused kernels; the reference claims ~5fps at 518x378.
 COMPILE = os.environ.get("MAP_COMPILE", "").lower() in ("1", "true", "yes")
+# NOT reduce-overhead. That mode wraps each graph in CUDA graphs, and lingbot's
+# RoPE memoises cos/sin components (rope.py _compute_frequency_components) — the
+# cached tensor is allocated in the graph's private pool, so the next replay
+# overwrites it and torch raises "accessing tensor output of CUDAGraphs that has
+# been overwritten by a subsequent run". Fixing that means patching the vendored
+# model to clone the cache out of graph memory; not worth it, since at ~190ms
+# per frame we are compute-bound, not kernel-launch-bound, which is the only
+# thing CUDA graphs buy. "default" still fuses elementwise/norm work.
+COMPILE_MODE = os.environ.get("MAP_COMPILE_MODE", "default")
 # 1.0 is the model's confidence floor, i.e. keep everything. Filtering here is
 # DESTRUCTIVE, and the viewer already ships per-point confidence with its own
 # threshold slider (default 1.5) — so keep the data and cull in the UI, which is
@@ -171,28 +180,29 @@ def _compile_model(model) -> None:
     """torch.compile the hot fixed-shape modules — same targets as demo.py."""
     agg = model.aggregator
     for i, b in enumerate(agg.frame_blocks):
-        agg.frame_blocks[i] = torch.compile(b, mode="reduce-overhead")
+        agg.frame_blocks[i] = torch.compile(b, mode=COMPILE_MODE)
     for i, b in enumerate(agg.patch_embed.blocks):
-        agg.patch_embed.blocks[i] = torch.compile(b, mode="reduce-overhead")
+        agg.patch_embed.blocks[i] = torch.compile(b, mode=COMPILE_MODE)
     for b in agg.global_blocks:
         if hasattr(b, "attn_pre"):
-            b.attn_pre = torch.compile(b.attn_pre, mode="reduce-overhead")
+            b.attn_pre = torch.compile(b.attn_pre, mode=COMPILE_MODE)
         if hasattr(b, "ffn_residual"):
-            b.ffn_residual = torch.compile(b.ffn_residual, mode="reduce-overhead")
-        b.attn.proj = torch.compile(b.attn.proj, mode="reduce-overhead")
-    print("[engine] compiled hot modules (reduce-overhead)")
+            b.ffn_residual = torch.compile(b.ffn_residual, mode=COMPILE_MODE)
+        b.attn.proj = torch.compile(b.attn.proj, mode=COMPILE_MODE)
+    print(f"[engine] compiled hot modules (mode={COMPILE_MODE})")
 
 
-def warm_compiled(model, images: torch.Tensor, keyframe_interval: int) -> None:
-    """Capture CUDA graphs at the SHAPE inference will replay.
+def warm_model(model, images: torch.Tensor, keyframe_interval: int) -> None:
+    """Run the model once at the SHAPE inference will use, before timing starts.
 
-    reduce-overhead keys graphs on shape, so warmup must use the same HxW and
-    scale-frame count as the real run, and must exercise the non-keyframe
-    (skip_append) path too — otherwise the first non-keyframe hits cold
-    orchestration. Mirrors demo.py's _warm_streaming.
+    Needed even without torch.compile: FlashInfer JIT-builds its attention
+    kernels on first call, which cost 12s of the first measured run (frames
+    0-8 took 12s, then steady state was 5.3 it/s). torch.compile keys its
+    graphs on shape as well, so warmup must use the same HxW and scale-frame
+    count as the real run, and must exercise the non-keyframe (skip_append)
+    path too, or the first non-keyframe hits cold orchestration. Mirrors
+    demo.py's _warm_streaming.
     """
-    if not COMPILE:
-        return
     t0 = time.time()
     num_avail = int(images.shape[1])
     scale = max(1, min(NUM_SCALE_FRAMES, num_avail - 1))
@@ -200,7 +210,8 @@ def warm_compiled(model, images: torch.Tensor, keyframe_interval: int) -> None:
     kf = max(1, keyframe_interval)
     warm_scale = images[:, :scale].to(_DEVICE)
     warm_stream = images[:, scale:scale + stream_n].to(_DEVICE)
-    for _ in range(3):
+    # Compiled graphs settle after a couple of passes; a plain JIT warm needs one.
+    for _ in range(3 if COMPILE else 1):
         model.clean_kv_cache()
         torch.compiler.cudagraph_mark_step_begin()
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
@@ -219,7 +230,8 @@ def warm_compiled(model, images: torch.Tensor, keyframe_interval: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     model.clean_kv_cache()
-    print(f"[engine] compile warmup done in {time.time() - t0:.1f}s")
+    print(f"[engine] warmup done in {time.time() - t0:.1f}s "
+          f"(compile={COMPILE}, backend={'sdpa' if USE_SDPA else 'flashinfer'})")
 
 
 def _preprocess_jpeg(jpeg_bytes: bytes) -> torch.Tensor:
@@ -367,7 +379,7 @@ class MapSession:
               f"{' [auto: >320-frame RoPE limit]' if keyframe_interval > 1 else ''}, "
               f"cam_iters={CAMERA_ITERS})…")
         with _infer_lock:
-            warm_compiled(model, images, keyframe_interval)
+            warm_model(model, images, keyframe_interval)
             t_inf = time.time()
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
                 preds = model.inference_streaming(
@@ -385,7 +397,8 @@ class MapSession:
         print(f"[perf] {S} frames in {infer_s:.1f}s = {S / max(infer_s, 1e-6):.2f} fps "
               f"| {W}x{H} = {patches} patches "
               f"| backend={'sdpa' if USE_SDPA else 'flashinfer'} "
-              f"compile={COMPILE} cam_iters={CAMERA_ITERS} keyframe={keyframe_interval} "
+              f"compile={COMPILE_MODE if COMPILE else False} "
+              f"cam_iters={CAMERA_ITERS} keyframe={keyframe_interval} "
               f"stride={PIXEL_STRIDE}")
         pose_enc = preds["pose_enc"]        # [1,S,9]
         depth = preds["depth"]              # [1,S,H,W,1]
