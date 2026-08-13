@@ -49,6 +49,7 @@ STUN_URLS = [u for u in os.environ.get(
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR",
                             os.path.join(os.path.dirname(__file__), "uploads"))
 VIDEO_FPS = int(os.environ.get("MAP_VIDEO_FPS", "10"))  # demo.py's sampling rate
+KEEP_UPLOADS = os.environ.get("MAP_KEEP_UPLOADS", "").lower() in ("1", "true", "yes")
 
 app = FastAPI(title="sg-map-builder")
 # The browser uploads videos straight to the pod (bypassing Express — the file
@@ -349,10 +350,17 @@ def _run_video_job(job_id: str, path: str) -> None:
         job["state"] = "error"
         job["error"] = str(err)[:300]
     finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        # Uploads are deleted by default — they are tens of MB each and the pod
+        # disk is small. MAP_KEEP_UPLOADS=1 keeps them so offline harnesses
+        # (check_streaming.py) have a real clip to run both paths against;
+        # otherwise the only copy lives on the phone that recorded it.
+        if KEEP_UPLOADS:
+            print(f"[video] kept upload at {path}")
+        else:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 @app.post("/video/upload")
