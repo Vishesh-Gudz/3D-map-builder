@@ -204,12 +204,31 @@ class AggregatorStream(AggregatorBase):
             tokens_per_frame: Actual number of tokens per frame (patches + specials).
                 If None, falls back to assuming square images of self.img_size.
         """
+        if tokens_per_frame is None:
+            tokens_per_frame = (self.img_size // self.patch_size) ** 2 + self.num_special_tokens
+        # The paged pool is sized from tokens_per_frame in __init__ and page_size
+        # is pinned to patches_per_frame, so a manager built for one frame shape
+        # cannot serve another — it fails deep in append_frame with
+        # "expected N patch tokens, got M". clean_kv_cache() only reset()s, which
+        # does not rebind the shape, so a single process that handled a portrait
+        # clip could never handle a landscape one. Drop and rebuild on change.
+        if (self.kv_cache_manager is not None
+                and self.kv_cache_manager.tokens_per_frame != tokens_per_frame):
+            logger.info(
+                f"Frame shape changed ({self.kv_cache_manager.tokens_per_frame} -> "
+                f"{tokens_per_frame} tokens/frame); rebuilding FlashInfer KV cache"
+            )
+            self.kv_cache_manager = None
+            # The pool is several GiB of live tensors, not allocator cache, so it
+            # must be released explicitly or both pools coexist until GC runs.
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         if self.kv_cache_manager is None:
             from lingbot_map.layers.flashinfer_cache import FlashInferKVCacheManager
             num_heads = self.embed_dim // 64  # head_dim = 64 for ViT-L
             head_dim = 64
-            if tokens_per_frame is None:
-                tokens_per_frame = (self.img_size // self.patch_size) ** 2 + self.num_special_tokens
             # max_num_frames: scale + window + headroom
             max_num_frames = self.kv_cache_scale_frames + self.kv_cache_sliding_window + 16
             self.kv_cache_manager = FlashInferKVCacheManager(

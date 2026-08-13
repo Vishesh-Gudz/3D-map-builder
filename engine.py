@@ -81,8 +81,8 @@ USE_SDPA = os.environ.get("MAP_USE_SDPA", "").lower() in ("1", "true", "yes") or
 # torch.compile the hot blocks. ON by default: measured +13% on landscape
 # (15.69 -> 17.72 fps) with identical output. Inductor compiles lazily per input
 # SHAPE and caches on the wrapper, so the cost is one-time per shape per process
-# — 15.1s on the first job, then 1.7s. We pay it at boot instead (see
-# warm_boot_shapes), so job 1 is already fast. Set MAP_COMPILE=0 to disable.
+# — 15.1s on the first job of a given aspect, then 1.7s. A pod runs for hours,
+# so that is paid once and forgotten. Set MAP_COMPILE=0 to disable.
 COMPILE = os.environ.get("MAP_COMPILE", "1").lower() not in ("0", "false", "no", "")
 # NOT reduce-overhead. That mode wraps each graph in CUDA graphs, and lingbot's
 # RoPE memoises cos/sin components (rope.py _compute_frequency_components) — the
@@ -177,39 +177,15 @@ def load_model() -> GCTStream:
           f"backend={'sdpa' if USE_SDPA else 'flashinfer'}, "
           f"compile={COMPILE_MODE if COMPILE else False}, "
           f"cam_iters={CAMERA_ITERS})")
-    warm_boot_shapes(model)
     return model
 
 
-# Shapes preprocessing actually produces: portrait pads to a square, 16:9
-# landscape crops to 518x294. Inductor keys its graphs on shape, so warming both
-# here means neither aspect pays compile cost on its first real job. An unlisted
-# aspect (4:3, say) still works — it just compiles on first use like before.
-BOOT_WARM_SHAPES = [(IMG_SIZE, IMG_SIZE), (294, IMG_SIZE)]
-
-
-def warm_boot_shapes(model) -> None:
-    """Pay torch.compile's per-shape cost at boot rather than on job 1.
-
-    Measured: first job with compile spent 15.1s in warmup, the second 1.7s —
-    the graphs are cached per (module, shape) for the process lifetime. The pod
-    stays up for hours, so moving that cost to startup makes it free.
-
-    Never fatal. A compile failure here would otherwise take the whole service
-    down at boot, and eager mode is a perfectly good fallback.
-    """
-    if not COMPILE or not torch.cuda.is_available():
-        return
-    t0 = time.time()
-    for h, w in BOOT_WARM_SHAPES:
-        try:
-            # 20 frames is enough for the scale block (8) plus a streaming run.
-            dummy = torch.zeros((1, 20, 3, h, w), dtype=torch.float32)
-            warm_model(model, dummy, keyframe_interval=1, quiet=True)
-        except Exception as exc:  # noqa: BLE001 - warmup is best-effort
-            print(f"[engine] boot warmup skipped for {w}x{h}: {exc}")
-    print(f"[engine] boot warmup done in {time.time() - t0:.1f}s "
-          f"for shapes {['x'.join(map(str, (w, h))) for h, w in BOOT_WARM_SHAPES]}")
+# NOTE: do NOT warm shapes at boot. It was tried and reverted — warming
+# 518x518 first bound the FlashInfer KV cache to 1369 patches, after which
+# every landscape job died in append_frame, and allocating that pool (~11.8GiB
+# at 1369 patches) alongside the compiled graphs OOM'd a 24GB card outright.
+# The shape rebind is fixed in the aggregator now, but the payoff was only
+# ~15s on the first job of a pod that runs for hours. Warmup stays per-job.
 
 
 def _compile_model(model) -> None:
