@@ -389,6 +389,11 @@ async def video_status(job_id: str) -> dict:
         "jobId": job_id, "state": job["state"], "frames": job["frames"],
         "points": job["points"], "chunks": len(job["chunks"]),
         "error": job["error"], "stats": job["stats"],
+        # Fusion snaps every point to this grid, so it IS the point spacing —
+        # the viewer needs it to size splats. Guessing from the bounding box
+        # gets it wrong: spacing is fixed, only the point COUNT grows with the
+        # map, so extent-scaled sizing over-draws on big scenes.
+        "voxelSize": engine.VOXEL_SIZE,
     }
 
 
