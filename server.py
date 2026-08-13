@@ -133,7 +133,12 @@ async def _capture_loop(s: engine.MapSession) -> None:
     last_ts = 0.0
     last_buf = 0.0
     last_status = 0.0
+    dropped = 0
     started = time.time()
+    # Per-session, not module-level: a frame surviving in a shared queue would
+    # be reconstructed into the NEXT session's map.
+    frames: asyncio.Queue = asyncio.Queue(maxsize=FRAME_QUEUE_MAX)
+    worker = asyncio.create_task(_reconstruct_loop(s, frames))
     print(f"[capture] buffering {s.peer_id} @ {CAPTURE_FPS}fps — waiting for stream")
     while _session is s and s.state == "capturing":
         slot = _rtc.bus.get(s.peer_id)
@@ -146,27 +151,59 @@ async def _capture_loop(s: engine.MapSession) -> None:
             continue
         arr, last_ts = slot
         last_buf = now
-        # Returns chunks only when MAP_LIVE_STREAMING is on; the batch path
-        # buffers and returns nothing until stop.
-        chunks = await asyncio.to_thread(s.add_frame_array, arr)
-        for c in chunks:
-            payload = _chunk_payload(s, c)
-            _chunk_buffer.append(payload)
-            if len(_chunk_buffer) > CHUNK_BUFFER_MAX:
-                _chunk_buffer.pop(0)
-            await _push_chunk(payload)
+        # Hand off, never process here. Reconstruction takes ~60-160ms/frame and
+        # _rtc.bus holds only the LATEST frame, so doing it inline drops every
+        # frame that lands while we are busy — measured 10fps capture collapsing
+        # to 1.3fps, which put ~75cm between frames and pinned depth confidence
+        # to its 1.0 floor for a whole walk.
+        try:
+            frames.put_nowait(arr)
+        except asyncio.QueueFull:
+            dropped += 1
+            if dropped % 20 == 1:
+                print(f"[capture] reconstruction behind — dropped {dropped} "
+                      f"frames (queue {frames.qsize()}). Record LANDSCAPE: "
+                      f"portrait is 1369 patches at ~6fps vs 777 at ~18fps.")
         if now - last_status >= 1.0:
             last_status = now
             try:
                 _push_queue.put_nowait({
                     "sessionId": s.session_id, "peerId": s.peer_id,
-                    "status": {"state": "mapping" if chunks else "warming",
+                    "status": {"state": "mapping" if s.total_points else "warming",
                                "frames": s.frames_in,
                                "points": s.total_points},
                 })
             except asyncio.QueueFull:
                 pass
-    print(f"[capture] buffered {s.frames_in} frames for {s.peer_id}")
+    await frames.join()            # let the worker finish what it has
+    worker.cancel()
+    print(f"[capture] buffered {s.frames_in} frames for {s.peer_id} "
+          f"({dropped} dropped)")
+
+
+# Bounded so a slow reconstruction cannot grow an unbounded backlog of 720p
+# frames. A little depth is good — it absorbs the jitter between a steady 10fps
+# capture and per-frame inference that varies with sequence length — but past a
+# second or so of lag the map is no longer tracking the walk, so drop instead.
+FRAME_QUEUE_MAX = int(os.environ.get("MAP_FRAME_QUEUE", "16"))
+
+
+async def _reconstruct_loop(s: engine.MapSession, frames: asyncio.Queue) -> None:
+    """Consume buffered frames and emit their geometry, off the capture path."""
+    while True:
+        arr = await frames.get()
+        try:
+            chunks = await asyncio.to_thread(s.add_frame_array, arr)
+            for c in chunks:
+                payload = _chunk_payload(s, c)
+                _chunk_buffer.append(payload)
+                if len(_chunk_buffer) > CHUNK_BUFFER_MAX:
+                    _chunk_buffer.pop(0)
+                await _push_chunk(payload)
+        except Exception as err:  # noqa: BLE001 - one bad frame must not end the session
+            print(f"[capture] frame reconstruction failed: {err}")
+        finally:
+            frames.task_done()
 
 
 async def _teardown_rtc() -> None:
