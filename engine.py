@@ -68,6 +68,19 @@ def auto_keyframe_interval(num_frames: int) -> int:
         return (num_frames + ROPE_FRAME_LIMIT - 1) // ROPE_FRAME_LIMIT
     return 1
 CAMERA_ITERS = int(os.environ.get("MAP_CAMERA_ITERS", "4"))  # demo default; 1 = fast/inaccurate
+# Attention backend. FlashInfer's paged KV cache is the reference's headline
+# speed optimisation; SDPA is the portable fallback. Auto-detect, override with
+# MAP_USE_SDPA=1 to force SDPA even when FlashInfer is installed.
+_FLASHINFER_OK = False
+try:  # noqa: SIM105 - probe only, never fatal
+    import flashinfer  # type: ignore  # noqa: F401
+    _FLASHINFER_OK = True
+except Exception:
+    pass
+USE_SDPA = os.environ.get("MAP_USE_SDPA", "").lower() in ("1", "true", "yes") or not _FLASHINFER_OK
+# torch.compile the hot blocks (reduce-overhead + CUDA graphs). Costs 30-60s of
+# warmup at boot, then replays; the reference claims ~5fps at 518x378.
+COMPILE = os.environ.get("MAP_COMPILE", "").lower() in ("1", "true", "yes")
 # 1.0 is the model's confidence floor, i.e. keep everything. Filtering here is
 # DESTRUCTIVE, and the viewer already ships per-point confidence with its own
 # threshold slider (default 1.5) — so keep the data and cull in the UI, which is
@@ -134,7 +147,7 @@ def load_model() -> GCTStream:
         kv_cache_scale_frames=NUM_SCALE_FRAMES,
         kv_cache_cross_frame_special=True,
         kv_cache_include_scale_frames=True,
-        use_sdpa=True,               # no FlashInfer/Triton dependency
+        use_sdpa=USE_SDPA,
         camera_num_iterations=CAMERA_ITERS,  # 4 = demo pose accuracy (fuses geometry)
     )
     ckpt = torch.load(MODEL_PATH, map_location=_DEVICE, weights_only=False)
@@ -144,10 +157,69 @@ def load_model() -> GCTStream:
     # Same trick as demo.py: bf16 trunk saves ~2-3GB; heads stay fp32 internally.
     if _DTYPE != torch.float32 and getattr(model, "aggregator", None) is not None:
         model.aggregator = model.aggregator.to(dtype=_DTYPE)
+    if COMPILE:
+        _compile_model(model)
     _model = model
     print(f"[engine] model loaded in {time.time() - t0:.1f}s "
-          f"(device={_DEVICE}, dtype={_DTYPE}, img_size={IMG_SIZE})")
+          f"(device={_DEVICE}, dtype={_DTYPE}, img_size={IMG_SIZE}, "
+          f"backend={'sdpa' if USE_SDPA else 'flashinfer'}, compile={COMPILE}, "
+          f"cam_iters={CAMERA_ITERS})")
     return model
+
+
+def _compile_model(model) -> None:
+    """torch.compile the hot fixed-shape modules — same targets as demo.py."""
+    agg = model.aggregator
+    for i, b in enumerate(agg.frame_blocks):
+        agg.frame_blocks[i] = torch.compile(b, mode="reduce-overhead")
+    for i, b in enumerate(agg.patch_embed.blocks):
+        agg.patch_embed.blocks[i] = torch.compile(b, mode="reduce-overhead")
+    for b in agg.global_blocks:
+        if hasattr(b, "attn_pre"):
+            b.attn_pre = torch.compile(b.attn_pre, mode="reduce-overhead")
+        if hasattr(b, "ffn_residual"):
+            b.ffn_residual = torch.compile(b.ffn_residual, mode="reduce-overhead")
+        b.attn.proj = torch.compile(b.attn.proj, mode="reduce-overhead")
+    print("[engine] compiled hot modules (reduce-overhead)")
+
+
+def warm_compiled(model, images: torch.Tensor, keyframe_interval: int) -> None:
+    """Capture CUDA graphs at the SHAPE inference will replay.
+
+    reduce-overhead keys graphs on shape, so warmup must use the same HxW and
+    scale-frame count as the real run, and must exercise the non-keyframe
+    (skip_append) path too — otherwise the first non-keyframe hits cold
+    orchestration. Mirrors demo.py's _warm_streaming.
+    """
+    if not COMPILE:
+        return
+    t0 = time.time()
+    num_avail = int(images.shape[1])
+    scale = max(1, min(NUM_SCALE_FRAMES, num_avail - 1))
+    stream_n = max(1, min(10, num_avail - scale))
+    kf = max(1, keyframe_interval)
+    warm_scale = images[:, :scale].to(_DEVICE)
+    warm_stream = images[:, scale:scale + stream_n].to(_DEVICE)
+    for _ in range(3):
+        model.clean_kv_cache()
+        torch.compiler.cudagraph_mark_step_begin()
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
+            model.forward(warm_scale, num_frame_for_scale=scale,
+                          num_frame_per_block=scale, causal_inference=True)
+        for i in range(stream_n):
+            is_kf = (kf <= 1) or (i % kf == 0)
+            if not is_kf:
+                model._set_skip_append(True)
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
+                model.forward(warm_stream[:, i:i + 1], num_frame_for_scale=scale,
+                              num_frame_per_block=1, causal_inference=True)
+            if not is_kf:
+                model._set_skip_append(False)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    model.clean_kv_cache()
+    print(f"[engine] compile warmup done in {time.time() - t0:.1f}s")
 
 
 def _preprocess_jpeg(jpeg_bytes: bytes) -> torch.Tensor:
@@ -294,13 +366,27 @@ class MapSession:
               f"scale={NUM_SCALE_FRAMES}, keyframe={keyframe_interval}"
               f"{' [auto: >320-frame RoPE limit]' if keyframe_interval > 1 else ''}, "
               f"cam_iters={CAMERA_ITERS})…")
-        with _infer_lock, torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
-            preds = model.inference_streaming(
-                images,
-                num_scale_frames=NUM_SCALE_FRAMES,
-                keyframe_interval=keyframe_interval,
-                output_device=torch.device("cpu"),
-            )
+        with _infer_lock:
+            warm_compiled(model, images, keyframe_interval)
+            t_inf = time.time()
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=_DTYPE):
+                preds = model.inference_streaming(
+                    images,
+                    num_scale_frames=NUM_SCALE_FRAMES,
+                    keyframe_interval=keyframe_interval,
+                    output_device=torch.device("cpu"),
+                )
+            infer_s = time.time() - t_inf
+        # One self-describing line per run so speed experiments are comparable
+        # without reading a progress bar. Patch count is the real cost driver:
+        # 518x518 = 1369 patches vs the reference's 518x378 = 999.
+        H, W = int(images.shape[-2]), int(images.shape[-1])
+        patches = (H // 14) * (W // 14)
+        print(f"[perf] {S} frames in {infer_s:.1f}s = {S / max(infer_s, 1e-6):.2f} fps "
+              f"| {W}x{H} = {patches} patches "
+              f"| backend={'sdpa' if USE_SDPA else 'flashinfer'} "
+              f"compile={COMPILE} cam_iters={CAMERA_ITERS} keyframe={keyframe_interval} "
+              f"stride={PIXEL_STRIDE}")
         pose_enc = preds["pose_enc"]        # [1,S,9]
         depth = preds["depth"]              # [1,S,H,W,1]
         depth_conf = preds["depth_conf"]    # [1,S,H,W]
