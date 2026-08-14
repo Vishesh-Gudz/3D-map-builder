@@ -78,6 +78,10 @@ class StreamingReconstructor:
         self.infer_s = 0.0
         self.fuse_s = 0.0
         self.rotated = 0
+        # Frames actually written to the KV cache — the count the RoPE limit
+        # applies to, which is NOT the same as frames seen once keyframes thin.
+        self.appended = scale_frames
+        self.rope_capped = False
         self._hw: Optional[Tuple[int, int]] = None
         self._pending: List[torch.Tensor] = []
         # Retained per-frame outputs for the full-quality pass at stop. Depth and
@@ -122,10 +126,11 @@ class StreamingReconstructor:
             return []
 
         block = frame.unsqueeze(0).unsqueeze(0)  # [1,1,3,H,W]
-        is_keyframe = (self.keyframe_interval <= 1) or (
-            (self.index - self.scale_frames) % self.keyframe_interval == 0)
+        is_keyframe = self._is_keyframe()
         if not is_keyframe:
             self.model._set_skip_append(True)
+        else:
+            self.appended += 1
         try:
             out = self._forward(block, n=1)
         finally:
@@ -135,6 +140,35 @@ class StreamingReconstructor:
             if not is_keyframe:
                 self.model._set_skip_append(False)
         return self._consume(out, [frame])
+
+    # The model's RoPE is trained to ~320 frames and pose COLLAPSES past it.
+    # Offline, demo.py knows N up front and picks a uniform ceil(N/320); a live
+    # session does not know how long the walk will be, so it cannot.
+    #
+    # Measured without any guard: a 650-frame walk held confidence 4.48 -> 4.93
+    # for two thirds and then fell to 2.07, with a 6.01m camera path collapsing
+    # into a 3.1m cloud.
+    #
+    # STOPGAP, not the fix. Once the cache holds a full trained range we stop
+    # appending: later frames still run and still produce geometry, they just
+    # stop extending context. Quality then PLATEAUS rather than collapsing —
+    # new frames are posed against older context, which drifts, but drift beats
+    # the garbage that comes out past the RoPE range. The real answer is
+    # windowed reconstruction (gct_stream_window), which re-bases the window
+    # instead of freezing it.
+    ROPE_FRAME_LIMIT = 320
+
+    def _is_keyframe(self) -> bool:
+        if self.appended >= self.ROPE_FRAME_LIMIT:
+            if not self.rope_capped:
+                self.rope_capped = True
+                print(f"[stream] {self.ROPE_FRAME_LIMIT}-frame RoPE limit reached "
+                      f"at frame {self.index}; context frozen. Quality will "
+                      f"plateau — shorter walks reconstruct better.")
+            return False
+        if self.keyframe_interval > 1:
+            return (self.index - self.scale_frames) % self.keyframe_interval == 0
+        return True
 
     def _forward(self, block: torch.Tensor, n: int) -> dict:
         t0 = time.time()

@@ -188,17 +188,51 @@ async def _capture_loop(s: engine.MapSession) -> None:
 FRAME_QUEUE_MAX = int(os.environ.get("MAP_FRAME_QUEUE", "16"))
 
 
+# One POST per frame saturates the uplink: a single push to Express measured
+# 0.5-2.2s, and at 8fps that is an arrival rate the pusher can never match — the
+# queue filled and hundreds of preview chunks were dropped. Merging a window of
+# frames into one chunk cuts the POST rate by roughly this many times, at the
+# cost of the preview updating in steps rather than per frame. Poses still go
+# out per frame so the camera trail stays smooth.
+PREVIEW_COALESCE = int(os.environ.get("MAP_PREVIEW_COALESCE", "6"))
+
+
+def _merge_chunks(s: engine.MapSession, pending: list) -> list:
+    """Combine several frames' point chunks into one, keeping poses separate."""
+    points = [c for c in pending if c.count > 0]
+    poses = [c for c in pending if c.count == 0]
+    if not points:
+        return poses
+    s.seq += 1
+    merged = engine.Chunk(
+        seq=s.seq,
+        count=sum(c.count for c in points),
+        points=b"".join(c.points for c in points),
+        colors=b"".join(c.colors for c in points),
+        confs=b"".join(c.confs for c in points),
+        # The merged cloud spans several frames, so no single pose describes it.
+        # Poses ride on their own zero-count chunks, which is how the batch path
+        # already carries the trajectory.
+        pose=[],
+    )
+    return [*poses, merged]
+
+
 async def _reconstruct_loop(s: engine.MapSession, frames: asyncio.Queue) -> None:
     """Consume buffered frames and emit their geometry, off the capture path."""
+    pending: list = []
     while True:
         arr = await frames.get()
         try:
             chunks = await asyncio.to_thread(s.add_frame_array, arr)
-            # Queue, never await the POST. Pushes to Express were measured at
-            # 0.5-1.7s; awaiting one per frame made the NETWORK the bottleneck
-            # rather than the GPU, and the queue backed up until frames were
-            # dropped. _push_worker drains in order in the background.
-            _enqueue_chunks(s, chunks)
+            pending.extend(chunks)
+            # Flush on a frame count, and whenever the queue has drained, so a
+            # paused walk still shows its last geometry instead of holding it.
+            if len(pending) >= PREVIEW_COALESCE or frames.empty():
+                # Queue, never await the POST — awaiting one per frame made the
+                # NETWORK the bottleneck rather than the GPU.
+                _enqueue_chunks(s, _merge_chunks(s, pending))
+                pending = []
         except Exception as err:  # noqa: BLE001 - one bad frame must not end the session
             print(f"[capture] frame reconstruction failed: {err}")
         finally:
