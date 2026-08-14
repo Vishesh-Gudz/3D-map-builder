@@ -77,6 +77,7 @@ class StreamingReconstructor:
         self.started = False
         self.infer_s = 0.0
         self.fuse_s = 0.0
+        self.rotated = 0
         self._hw: Optional[Tuple[int, int]] = None
         self._pending: List[torch.Tensor] = []
         # Retained per-frame outputs for the full-quality pass at stop. Depth and
@@ -107,6 +108,18 @@ class StreamingReconstructor:
             self._hw = tuple(block.shape[-2:])
             self.model.clean_kv_cache()
             return self._consume(self._forward(block, n=self.scale_frames), batch_frames)
+
+        # Rotating the phone mid-session changes the encoded frame shape. That
+        # would force the FlashInfer KV pool to be rebuilt — wiping every frame
+        # of accumulated context — and retained()'s torch.stack would fail on
+        # the mixed shapes anyway. Drop the odd frames instead: a few lost
+        # frames degrade the map, a reset destroys it.
+        if tuple(frame.shape[-2:]) != self._hw:
+            self.rotated += 1
+            if self.rotated % 30 == 1:
+                print(f"[stream] ignoring {tuple(frame.shape[-2:])} frame — session "
+                      f"started at {self._hw}. Do not rotate the phone mid-capture.")
+            return []
 
         block = frame.unsqueeze(0).unsqueeze(0)  # [1,1,3,H,W]
         is_keyframe = (self.keyframe_interval <= 1) or (
