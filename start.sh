@@ -9,6 +9,15 @@ echo "== [1/4] python deps =="
 export PIP_BREAK_SYSTEM_PACKAGES=1
 pip install -q --ignore-installed -e .
 pip install -q --ignore-installed fastapi 'uvicorn[standard]' httpx onnxruntime aiortc av "python-socketio[asyncio_client]" python-multipart opencv-python-headless
+# FlashInfer's paged KV cache is worth ~1.5x over SDPA and costs nothing in
+# quality (measured 4.09 -> 5.02 fps portrait, identical confidence). It was
+# installed by hand on one pod and silently missing on the next, which showed
+# up as a landscape upload dropping 17.7 -> 9.2 fps. Never fatal: engine.py
+# probes for it and falls back to SDPA.
+pip install -q flashinfer-python || echo "  flashinfer unavailable — falling back to SDPA"
+# flashinfer pins protobuf<7 while the line above pulls 7.x; the resolver warns
+# but loads fine. Pin here so a fresh pod resolves the same way every time.
+pip install -q "protobuf<7,>=6.30.2" 2>/dev/null || true
 
 echo "== [2/4] model weights =="
 python fetch_model.py
