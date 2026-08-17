@@ -66,6 +66,14 @@ class WhepSubscriber:
         # recvonly — we consume, never publish. Without an explicit transceiver
         # the offer carries no media section and MediaMTX has nothing to answer.
         pc.addTransceiver("video", direction="recvonly")
+        # Audio too, even though the mapper only ever reads video frames.
+        # MediaMTX matches EVERY published track against the offer and rejects
+        # the whole subscription with "codecs not supported by client" if one
+        # has no match — so a publisher that happens to carry audio (a browser
+        # test page, or a phone build that stops passing audio:false) would
+        # otherwise fail in a way that reads like a codec or network problem.
+        # The track is received and dropped; on_track only drains video.
+        pc.addTransceiver("audio", direction="recvonly")
 
         @pc.on("track")
         def on_track(track) -> None:
