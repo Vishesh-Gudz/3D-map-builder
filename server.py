@@ -320,8 +320,13 @@ async def start(body: dict) -> dict:
         # SFU: the phone publishes ONE copy to MediaMTX and we read it back.
         # No ICE servers — MediaMTX has a public IP, so the pod's symmetric NAT
         # stops mattering and TURN is not involved.
-        if _rtc is None:
-            _rtc = WhepSubscriber(WHEP_URL, peer_id)
+        #
+        # ALWAYS a fresh subscriber, unlike the mesh branch below. The WHEP path
+        # IS the peer id, so one carried over from a previous session subscribes
+        # to a stream that no longer exists. _teardown_rtc stops the old one but
+        # deliberately leaves the reference, so reusing it here would fail on the
+        # SECOND session of a run while the first looked perfect.
+        _rtc = WhepSubscriber(WHEP_URL, peer_id)
         try:
             await _rtc.start()
             _capture_task = asyncio.create_task(_capture_loop(_session))
