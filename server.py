@@ -24,7 +24,7 @@ import asyncio
 import base64
 import threading
 import time
-from typing import Optional
+from typing import Optional, Union
 
 import glob
 
@@ -35,6 +35,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import engine
 from rtc_client import RtcSubscriber
+from whep_client import WhepSubscriber
 
 SERVER_URL = os.environ.get("SERVER_URL", "")  # e.g. http://localhost:3001
 IDLE_TIMEOUT_SEC = int(os.environ.get("MAP_IDLE_TIMEOUT", "60"))
@@ -43,6 +44,11 @@ CHUNK_BUFFER_MAX = 500
 # SERVER_URL) and consumes the phone's real video stream during a session.
 ROOM_ID = os.environ.get("ROOM_ID", "shipment-glasses-dev")
 RTC_PEER_ID = os.environ.get("RTC_PEER_ID", "viewer-mapper")  # "viewer" prefix → phones auto-offer
+# MediaMTX base, e.g. http://<vm>:8889 (or https://api.../media once behind
+# nginx). When set, the pod subscribes via WHEP instead of joining the mesh:
+# the phone then uploads ONE copy regardless of viewer count, and TURN is not
+# needed because MediaMTX has a public IP. Unset keeps the legacy mesh path.
+WHEP_URL = os.environ.get("MAP_WHEP_URL", "").rstrip("/")
 STUN_URLS = [u for u in os.environ.get(
     "STUN_URLS", "stun:stun.l.google.com:19302").split(",") if u]
 
@@ -68,7 +74,8 @@ _push_client = httpx.AsyncClient(timeout=10)
 # GPU the moment inference is done — the pod→Express push must not hold up the
 # next frame.
 _push_queue: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=200)
-_rtc: Optional[RtcSubscriber] = None
+# Either subscriber — both expose .bus / .start() / .stop() / .frames_flowing().
+_rtc: Optional[Union[RtcSubscriber, WhepSubscriber]] = None
 _capture_task: Optional[asyncio.Task] = None
 
 
@@ -307,9 +314,23 @@ async def start(body: dict) -> dict:
             except OSError:
                 pass
 
-    # Join the WebRTC room and consume the phone's real stream. Falls back to
-    # the HTTP /frame path (old JPEG lane) if signaling is unreachable.
-    if SERVER_URL:
+    # Consume the phone's stream, either from the SFU (preferred) or as a mesh
+    # peer (legacy). Falls back to the HTTP /frame path if neither connects.
+    if WHEP_URL:
+        # SFU: the phone publishes ONE copy to MediaMTX and we read it back.
+        # No ICE servers — MediaMTX has a public IP, so the pod's symmetric NAT
+        # stops mattering and TURN is not involved.
+        if _rtc is None:
+            _rtc = WhepSubscriber(WHEP_URL, peer_id)
+        try:
+            await _rtc.start()
+            _capture_task = asyncio.create_task(_capture_loop(_session))
+        except Exception as err:
+            # Most likely nothing is publishing to that path yet — the phone has
+            # to start before the pod subscribes.
+            print(f"[server] whep connect failed ({err}) — HTTP frame path only")
+            _rtc = None
+    elif SERVER_URL:
         if _rtc is None:
             _rtc = RtcSubscriber(SERVER_URL, ROOM_ID, RTC_PEER_ID, STUN_URLS)
         try:
