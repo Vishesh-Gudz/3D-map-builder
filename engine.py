@@ -117,6 +117,11 @@ LIVE_STREAMING = os.environ.get("MAP_LIVE_STREAMING", "").lower() in ("1", "true
 # produced at stop from the retained frames, so nothing is lost — only deferred.
 LIVE_PREVIEW_STRIDE = int(os.environ.get("MAP_PREVIEW_STRIDE", "2"))
 LIVE_PREVIEW_VOXEL = float(os.environ.get("MAP_PREVIEW_VOXEL", "0.02"))
+# Cap on what the BROWSER receives. Reconstruction density and display density
+# are separate concerns: a 2mm grid produced 36.8M points, which is a perfectly
+# good file and an unrenderable web page. Anything above this is strided down
+# for display only — the PLY still contains every point.
+VIEWER_MAX_POINTS = int(os.environ.get("MAP_VIEWER_MAX_POINTS", "8000000"))
 MAPS_DIR = os.environ.get("MAPS_DIR", os.path.join(os.path.dirname(__file__), "maps"))
 # auto = crop for landscape, pad for portrait — the only correct default.
 # crop resizes width to IMG_SIZE and centre-crops the overflow, so it discards
@@ -381,6 +386,10 @@ class MapSession:
     last_frame_at: float = field(default_factory=time.time)
     # Live streaming state (MAP_LIVE_STREAMING). None means the batch path.
     stream: object = None
+    # Full-resolution cloud for the PLY, kept separately because the viewer may
+    # only have been sent a decimated subset of it.
+    full_xyz: object = None
+    full_rgb: object = None
 
     # ── live streaming ────────────────────────────────────────────────────
     def _stream_frame(self, tensor: torch.Tensor) -> list["Chunk"]:
@@ -658,6 +667,29 @@ class MapSession:
                   f"({xyz.shape[0] / max(1, fused_xyz.shape[0]):.1f} views each)")
             del xyz, rgbs, confs, vox, keys, inv
 
+            # The PLY keeps EVERY point; only the browser gets a reduced set.
+            # Reconstruction density and display density are different problems:
+            # a 2mm grid produced 36.8M points, which no browser can render, but
+            # the file is perfectly good in CloudCompare.
+            self.full_xyz, self.full_rgb = fused_xyz, fused_rgb
+
+            n_full = int(fused_xyz.shape[0])
+            if n_full > VIEWER_MAX_POINTS:
+                # Stride, not truncate. Voxel keys are sorted lexicographically
+                # by (x,y,z), so taking the FIRST N points returns one end of
+                # the map — a 36.8M-point cloud rendered as a thin slab because
+                # the viewer stopped at its 10M budget. Striding the same sorted
+                # order samples the whole extent evenly instead, so an
+                # over-budget map degrades to a sparser WHOLE map.
+                step = n_full / VIEWER_MAX_POINTS
+                keep = (np.arange(VIEWER_MAX_POINTS) * step).astype(np.int64)
+                print(f"[engine] {n_full} points exceeds the viewer budget "
+                      f"({VIEWER_MAX_POINTS}) — sending every {step:.1f}th for "
+                      f"display; the PLY keeps all of them")
+                fused_xyz = fused_xyz[keep]
+                fused_rgb = fused_rgb[keep]
+                fused_conf = fused_conf[keep]
+
             # 200k points was ~5MB of base64 per chunk, and a 40-chunk page then
             # exceeded what the RunPod proxy would carry. 50k keeps each chunk
             # near 1.2MB so pages stay transferable.
@@ -738,12 +770,18 @@ class MapSession:
                 torch.cuda.empty_cache()
 
         ply_path = ""
-        if self.acc_xyz:
+        # Prefer the FULL cloud over the decimated one the viewer received —
+        # the file is for CloudCompare/MeshLab, which have no 10M-point limit.
+        if self.full_xyz is not None or self.acc_xyz:
             os.makedirs(MAPS_DIR, exist_ok=True)
-            xyz = np.concatenate(self.acc_xyz, axis=0)
-            rgb = np.concatenate(self.acc_rgb, axis=0)
+            if self.full_xyz is not None:
+                xyz, rgb = self.full_xyz, self.full_rgb
+            else:
+                xyz = np.concatenate(self.acc_xyz, axis=0)
+                rgb = np.concatenate(self.acc_rgb, axis=0)
             ply_path = os.path.join(MAPS_DIR, f"{self.session_id}.ply")
             _write_ply(ply_path, xyz, rgb)
+            print(f"[engine] wrote {xyz.shape[0]} points to {ply_path}")
 
         return {
             "sessionId": self.session_id,
