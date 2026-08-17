@@ -693,6 +693,12 @@ class MapSession:
             # 200k points was ~5MB of base64 per chunk, and a 40-chunk page then
             # exceeded what the RunPod proxy would carry. 50k keeps each chunk
             # near 1.2MB so pages stay transferable.
+            #
+            # DO NOT RAISE WITHOUT CHANGING EXPRESS TOO. The live path POSTs
+            # these to shipment-glasses' /map-chunk, which caps bodies at 2mb.
+            # 50,000 x 19 bytes base64'd is ~1.3MB, leaving ~35% headroom; going
+            # bigger makes Express return 413 and the map simply stops arriving,
+            # with no error logged on either side.
             PAGE = 50_000
             for i in range(0, fused_xyz.shape[0], PAGE):
                 px = fused_xyz[i:i + PAGE]
